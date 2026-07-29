@@ -1,0 +1,27 @@
+{
+  "captured_at": "2026-07-27",
+  "archives": [
+    {
+      "name": "codex-main.zip",
+      "source": "C:/Users/HP/Downloads/codex-main.zip",
+      "sha256": "0879b1af70f0fe628a22ceb2b3aad2be0ceca92e9df32db6c880c16dace6dba7",
+      "zip_entries": 6547,
+      "extracted_files": 5747,
+      "crc_check": "passed",
+      "unsafe_paths": 0,
+      "destination": "upstream/codex",
+      "read_only": true
+    },
+    {
+      "name": "gemini-cli-main.zip",
+      "source": "C:/Users/HP/Downloads/gemini-cli-main.zip",
+      "sha256": "36332787e101521f5c5f4f3e12713c5b1ccf34ed95f8f618847862837cd2476c",
+      "zip_entries": 3217,
+      "extracted_files": 2932,
+      "crc_check": "passed",
+      "unsafe_paths": 0,
+      "destination": "upstream/gemini-cli",
+      "read_only": true
+    }
+  ]
+}

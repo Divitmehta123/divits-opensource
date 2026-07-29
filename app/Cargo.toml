@@ -1,0 +1,59 @@
+[workspace]
+members = [
+    "opensrc-core",
+    "opensrc-store",
+    "opensrc-runtime",
+    "opensrc-providers",
+    "opensrc-server",
+    "opensrc-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.88"
+
+[workspace.dependencies]
+anyhow = "1"
+async-recursion = "1"
+async-trait = "0.1"
+async-stream = "0.3"
+base64 = "0.22"
+axum = { version = "0.8", features = ["json", "tokio", "http1"] }
+chrono = { version = "0.4.43", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+crossterm = "0.28.1"
+diffy = "0.4"
+futures = "0.3"
+keyring = "4.1"
+ratatui = { version = "0.29.0", features = ["unstable-rendered-line-info"] }
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rusqlite = { version = "0.38", features = ["bundled"] }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+shell-words = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+toml = "0.8"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+walkdir = "2"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Public API reference documentation is staged for the stabilization phase.
+missing_errors_doc = "allow"

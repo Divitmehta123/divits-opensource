@@ -1,0 +1,209 @@
+{
+  "benchmark": "local_mode_classifier",
+  "results": [
+    {
+      "accepted": true,
+      "decision": {
+        "mode": "direct",
+        "reasons": [
+          "request requires no local action"
+        ]
+      },
+      "description": "Answer with no tools",
+      "id": "direct_question",
+      "iterations": 500,
+      "latency_ns": {
+        "max": 45000,
+        "p50": 5100,
+        "p95": 8700
+      }
+    },
+    {
+      "accepted": true,
+      "decision": {
+        "mode": "direct",
+        "reasons": [
+          "request requires no local action"
+        ]
+      },
+      "description": "Explain one selected file",
+      "id": "explain_file",
+      "iterations": 500,
+      "latency_ns": {
+        "max": 13100,
+        "p50": 6700,
+        "p95": 6900
+      }
+    },
+    {
+      "accepted": true,
+      "decision": {
+        "mode": "focused",
+        "reasons": [
+          "request names a localized coding action"
+        ]
+      },
+      "description": "Make and validate one-line edit",
+      "id": "one_line_edit",
+      "iterations": 500,
+      "latency_ns": {
+        "max": 5600,
+        "p50": 3200,
+        "p95": 3500
+      }
+    },
+    {
+      "accepted": true,
+      "decision": {
+        "mode": "focused",
+        "reasons": [
+          "request requires local actions but not a full task graph"
+        ]
+      },
+      "description": "Run one command and interpret output",
+      "id": "one_command",
+      "iterations": 500,
+      "latency_ns": {
+        "max": 15700,
+        "p50": 7800,
+        "p95": 8500
+      }
+    },
+    {
+      "accepted": true,
+      "decision": {
+        "mode": "focused",
+        "reasons": [
+          "request names a localized coding action"
+        ]
+      },
+      "description": "Fix a local bug",
+      "id": "local_bug",
+      "iterations": 500,
+      "latency_ns": {
+        "max": 13000,
+        "p50": 4600,
+        "p95": 7200
+      }
+    },
+    {
+      "accepted": true,
+      "decision": {
+        "mode": "agentic",
+        "reasons": [
+          "request spans an unknown, broad, or multi-component area"
+        ]
+      },
+      "description": "Implement a multi-file feature",
+      "id": "multi_file_feature",
+      "iterations": 500,
+      "latency_ns": {
+        "max": 62200,
+        "p50": 6500,
+        "p95": 7000
+      }
+    },
+    {
+      "accepted": true,
+      "decision": {
+        "mode": "agentic",
+        "reasons": [
+          "request spans an unknown, broad, or multi-component area"
+        ]
+      },
+      "description": "Parallel repository investigation",
+      "id": "parallel_investigation",
+      "iterations": 500,
+      "latency_ns": {
+        "max": 9600,
+        "p50": 5800,
+        "p95": 7300
+      }
+    },
+    {
+      "accepted": true,
+      "decision": {
+        "mode": "agentic",
+        "reasons": [
+          "request spans an unknown, broad, or multi-component area"
+        ]
+      },
+      "description": "Parallel client and server work",
+      "id": "parallel_frontend_backend",
+      "iterations": 500,
+      "latency_ns": {
+        "max": 9000,
+        "p50": 6200,
+        "p95": 7200
+      }
+    },
+    {
+      "accepted": true,
+      "decision": {
+        "mode": "focused",
+        "reasons": [
+          "request requires local actions but not a full task graph"
+        ]
+      },
+      "description": "Review a change set",
+      "id": "code_review",
+      "iterations": 500,
+      "latency_ns": {
+        "max": 21700,
+        "p50": 13100,
+        "p95": 13900
+      }
+    },
+    {
+      "accepted": true,
+      "decision": {
+        "mode": "agentic",
+        "reasons": [
+          "request spans an unknown, broad, or multi-component area"
+        ]
+      },
+      "description": "Validate browser UI",
+      "id": "browser_validation",
+      "iterations": 500,
+      "latency_ns": {
+        "max": 13300,
+        "p50": 6300,
+        "p95": 6800
+      }
+    },
+    {
+      "accepted": true,
+      "decision": {
+        "mode": "focused",
+        "reasons": [
+          "request requires local actions but not a full task graph"
+        ]
+      },
+      "description": "Monitor long-running tests",
+      "id": "long_test",
+      "iterations": 500,
+      "latency_ns": {
+        "max": 16900,
+        "p50": 13500,
+        "p95": 14400
+      }
+    },
+    {
+      "accepted": true,
+      "decision": {
+        "mode": "agentic",
+        "reasons": [
+          "request spans an unknown, broad, or multi-component area"
+        ]
+      },
+      "description": "Work in a context-heavy repository",
+      "id": "context_heavy",
+      "iterations": 500,
+      "latency_ns": {
+        "max": 12700,
+        "p50": 7700,
+        "p95": 8200
+      }
+    }
+  ]
+}

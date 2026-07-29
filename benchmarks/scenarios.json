@@ -1,0 +1,14 @@
+[
+  {"id":"direct_question","description":"Answer with no tools","prompt":"Explain Rust ownership in two paragraphs.","modes":["direct"]},
+  {"id":"explain_file","description":"Explain one selected file","prompt":"Explain the already-selected file and its main abstractions.","modes":["direct","focused"]},
+  {"id":"one_line_edit","description":"Make and validate one-line edit","prompt":"Fix the one-line bug in src/main.rs.","modes":["focused"]},
+  {"id":"one_command","description":"Run one command and interpret output","prompt":"Run the local unit test command and explain a failure.","modes":["focused"]},
+  {"id":"local_bug","description":"Fix a local bug","prompt":"Fix the localized parser bug in parser.rs and test it.","modes":["focused","agentic"]},
+  {"id":"multi_file_feature","description":"Implement a multi-file feature","prompt":"Implement a multi-module feature across the server and client.","modes":["agentic"]},
+  {"id":"parallel_investigation","description":"Parallel repository investigation","prompt":"Investigate this unknown repository area in parallel.","modes":["agentic"]},
+  {"id":"parallel_frontend_backend","description":"Parallel client and server work","prompt":"Implement the frontend and backend portions in parallel.","modes":["agentic"]},
+  {"id":"code_review","description":"Review a change set","prompt":"Review the focused change set for correctness and tests.","modes":["focused","agentic"]},
+  {"id":"browser_validation","description":"Validate browser UI","prompt":"Use browser validation for the redesigned interface.","modes":["agentic"]},
+  {"id":"long_test","description":"Monitor long-running tests","prompt":"Run and monitor the long integration test suite.","modes":["focused","agentic"]},
+  {"id":"context_heavy","description":"Work in a context-heavy repository","prompt":"Migrate the architecture in this context-heavy entire repository.","modes":["agentic"]}
+]

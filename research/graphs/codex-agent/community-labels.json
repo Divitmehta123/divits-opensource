@@ -1,0 +1,22 @@
+{
+  "0": "Agent Control Messaging",
+  "1": "Registry Capacity Tracking",
+  "2": "Role Configuration Tests",
+  "3": "Resident Agent Eviction",
+  "4": "Thread Lifecycle Tests",
+  "5": "Spawn Resume Control",
+  "6": "Context Configuration Tests",
+  "7": "Registry Behavior Tests",
+  "8": "History Forking Tests",
+  "9": "Role Configuration Resolution",
+  "10": "Execution Concurrency Limits",
+  "11": "Tree Restore Shutdown",
+  "12": "Event Driven Status",
+  "13": "Paginated History Forking",
+  "14": "Residency Eviction Tests",
+  "15": "Execution Guard Tests",
+  "16": "Agent Tree Shutdown",
+  "17": "Agent Target Resolution",
+  "18": "Agent Module Surface",
+  "19": "Legacy Agent Compatibility"
+}

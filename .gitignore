@@ -1,0 +1,33 @@
+# Rust build output
+/app/target/
+
+# Local project state, generated verification workspaces, and graph exports.
+/.opensource/
+/live-e2e-*/
+**/graphify-out/
+
+# Verified reference trees are reproducible from the original archives.
+/upstream/
+
+# Local runtime state and credentials
+/state/
+*.db
+*.db-shm
+*.db-wal
+.env
+.env.*
+!.env.example
+
+# Test and runtime logs
+/tests/*.log
+
+# Python caches used by research helpers
+__pycache__/
+*.py[cod]
+/research/graphs/**/graphify-out/cache/
+
+# Editor and operating-system noise
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

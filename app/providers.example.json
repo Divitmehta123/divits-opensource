@@ -1,0 +1,102 @@
+{
+  "providers": [
+    {
+      "id": "aicredits",
+      "protocol": "openai_compatible",
+      "family": "aicredits",
+      "base_url": "https://api.aicredits.in/v1",
+      "api_key_env": "AICREDITS_API_KEY",
+      "default_model": "google/gemini-2.5-flash",
+      "models": [
+        "google/gemini-2.5-flash"
+      ]
+    },
+    {
+      "id": "deepseek",
+      "protocol": "openai_compatible",
+      "family": "deepseek",
+      "base_url": "https://api.deepseek.com",
+      "api_key_env": "DEEPSEEK_API_KEY",
+      "default_model": "deepseek-v4-pro",
+      "models": [
+        "deepseek-v4-pro"
+      ],
+      "capabilities": {
+        "supports_streaming": true,
+        "supports_tool_calls": true,
+        "supports_parallel_tool_calls": true,
+        "supports_structured_output": true,
+        "supports_reasoning_controls": true,
+        "supports_prompt_caching": false,
+        "supports_previous_response_continuation": false,
+        "supports_context_reuse": false,
+        "supports_native_token_counting": true,
+        "supports_multimodal_input": false,
+        "supports_thought_signatures": false,
+        "supports_batch_requests": false
+      }
+    },
+    {
+      "id": "kimi",
+      "protocol": "openai_compatible",
+      "family": "kimi",
+      "base_url": "https://api.kimi.com/coding/v1",
+      "api_key_env": "KIMI_API_KEY",
+      "default_model": "kimi-k2.7-code",
+      "models": [
+        "kimi-k2.7-code",
+        "kimi-for-coding"
+      ],
+      "capabilities": {
+        "supports_streaming": true,
+        "supports_tool_calls": true,
+        "supports_parallel_tool_calls": true,
+        "supports_structured_output": true,
+        "supports_reasoning_controls": false,
+        "supports_prompt_caching": true,
+        "supports_previous_response_continuation": false,
+        "supports_context_reuse": true,
+        "supports_native_token_counting": true,
+        "supports_multimodal_input": true,
+        "supports_thought_signatures": false,
+        "supports_batch_requests": false
+      }
+    },
+    {
+      "id": "zai",
+      "protocol": "openai_compatible",
+      "family": "glm",
+      "base_url": "https://api.z.ai/api/paas/v4",
+      "api_key_env": "ZAI_API_KEY",
+      "default_model": "glm-4.5",
+      "models": [
+        "glm-4.5"
+      ],
+      "capabilities": {
+        "supports_streaming": true,
+        "supports_tool_calls": true,
+        "supports_parallel_tool_calls": true,
+        "supports_structured_output": true,
+        "supports_reasoning_controls": true,
+        "supports_prompt_caching": false,
+        "supports_previous_response_continuation": false,
+        "supports_context_reuse": false,
+        "supports_native_token_counting": true,
+        "supports_multimodal_input": false,
+        "supports_thought_signatures": false,
+        "supports_batch_requests": false
+      }
+    },
+    {
+      "id": "openrouter",
+      "protocol": "openai_compatible",
+      "family": "openrouter",
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "default_model": "google/gemini-3.6-flash",
+      "models": [
+        "google/gemini-3.6-flash"
+      ]
+    }
+  ]
+}

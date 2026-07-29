@@ -1,0 +1,87 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: divits-opensource-windows-x64.zip
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: divits-opensource-linux-x64.tar.gz
+          - os: macos-14
+            target: aarch64-apple-darwin
+            archive: divits-opensource-macos-arm64.tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
+            archive: divits-opensource-macos-x64.tar.gz
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app
+          key: ${{ matrix.target }}
+      - run: cargo build --release --locked -p divits-opensource --target ${{ matrix.target }}
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: .
+        run: |
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Copy-Item "app/target/${{ matrix.target }}/release/divit.exe" dist/
+          Copy-Item scripts/install.cmd dist/
+          Copy-Item scripts/install-binary.ps1 dist/
+          Copy-Item app/LICENSE dist/
+          Copy-Item README.md dist/
+          Compress-Archive -Path dist/* -DestinationPath "${{ matrix.archive }}"
+          ((Get-FileHash -LiteralPath "${{ matrix.archive }}" -Algorithm SHA256).Hash.ToLower() + "  ${{ matrix.archive }}") |
+            Set-Content -LiteralPath "${{ matrix.archive }}.sha256" -Encoding ascii
+      - name: Package Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        working-directory: .
+        run: |
+          mkdir -p dist
+          cp "app/target/${{ matrix.target }}/release/divit" dist/
+          cp scripts/install.sh app/LICENSE README.md dist/
+          chmod +x dist/divit dist/install.sh
+          tar -C dist -czf "${{ matrix.archive }}" .
+          sha256sum "${{ matrix.archive }}" > "${{ matrix.archive }}.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: |
+            ${{ matrix.archive }}
+            ${{ matrix.archive }}.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: artifacts/*
