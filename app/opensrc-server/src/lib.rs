@@ -1716,13 +1716,23 @@ async fn list_models(
             .is_none_or(|provider| provider == descriptor.id)
     });
     let mut models = Vec::new();
+    let mut discovery_errors = Vec::new();
     for descriptor in selected {
         let discovered = if query.refresh {
-            let models = state.runtime.providers.list_models(&descriptor.id).await?;
-            if !models.is_empty() {
-                persist_discovered_models(&state, &descriptor.id, &models)?;
+            if let Ok(models) = state.runtime.providers.list_models(&descriptor.id).await {
+                if !models.is_empty() {
+                    persist_discovered_models(&state, &descriptor.id, &models)?;
+                }
+                models
+            } else {
+                // Model discovery is optional. A provider can still serve the configured
+                // default model when its catalog endpoint is unavailable or rate limited.
+                discovery_errors.push(json!({
+                    "provider": descriptor.id,
+                    "message": "Could not refresh this provider's model catalog; saved and default models remain available."
+                }));
+                state.runtime.providers.known_models(&descriptor.id)
             }
-            models
         } else {
             state.runtime.providers.known_models(&descriptor.id)
         };
@@ -1736,7 +1746,10 @@ async fn list_models(
             ));
         }
     }
-    Ok(Json(json!({"models": models})))
+    Ok(Json(json!({
+        "models": models,
+        "discovery_errors": discovery_errors
+    })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2860,6 +2873,69 @@ mod tests {
                 },
             ])
         }
+    }
+
+    struct FailingDiscoveryProvider;
+
+    #[async_trait]
+    impl ProviderAdapter for FailingDiscoveryProvider {
+        fn id(&self) -> &'static str {
+            "fixture-discovery"
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+
+        async fn execute(
+            &self,
+            _request: CanonicalModelRequest,
+        ) -> Result<Vec<ModelEvent>, ProviderError> {
+            Err(ProviderError::Rejected(
+                "not used by model discovery".to_string(),
+            ))
+        }
+
+        async fn list_models(&self) -> Result<Vec<String>, ProviderError> {
+            Err(ProviderError::Transient(
+                "catalog endpoint unavailable".to_string(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn model_refresh_keeps_default_models_when_a_provider_catalog_fails() {
+        let store = Store::in_memory().expect("store");
+        let providers = ProviderRouter::default();
+        providers.register_with_model(Arc::new(FailingDiscoveryProvider), "configured-model");
+        let app = router(ServerState {
+            runtime: Runtime::with_services(
+                store,
+                AgentLimits::default(),
+                providers,
+                ToolExecutor::default(),
+            ),
+            provider_config_path: None,
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models?refresh=true")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body"),
+        )
+        .expect("JSON response");
+        assert_eq!(body["models"][0]["id"], "configured-model");
+        assert_eq!(body["discovery_errors"][0]["provider"], "fixture-discovery");
     }
 
     #[test]
