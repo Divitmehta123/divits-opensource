@@ -24,7 +24,7 @@ use opensrc_core::{
 };
 use opensrc_runtime::{
     CustomCommand, McpServer, ModelPackDescriptor, RolePolicyDescriptor, SkillMetadata,
-    ToolDescriptor, expand_custom_command,
+    ToolDescriptor, expand_custom_command, is_continuation_request,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -1924,6 +1924,26 @@ fn friendly_chat_error(error: String) -> String {
     }
 }
 
+async fn chat_response_result(response: reqwest::Response) -> Result<(), String> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let payload = response.json::<Value>().await.ok();
+    Err(chat_error_message(status, payload.as_ref()))
+}
+
+fn chat_error_message(status: reqwest::StatusCode, payload: Option<&Value>) -> String {
+    payload
+        .and_then(|value| value.pointer("/error/message"))
+        .and_then(Value::as_str)
+        .filter(|message| !message.trim().is_empty())
+        .map_or_else(
+            || format!("request failed with HTTP {status}"),
+            |message| format!("{message} (HTTP {status})"),
+        )
+}
+
 fn approval_decision_for_key(key: KeyEvent) -> Option<ApprovalDecision> {
     match key.code {
         KeyCode::Char('y' | 'Y') | KeyCode::Enter => Some(ApprovalDecision::AllowOnce),
@@ -2485,12 +2505,17 @@ struct ModelTaskRequirements {
 fn model_task_requirements(
     prompt: &str,
     attachments: &[PendingAttachment],
+    history: &[Message],
     mode: Option<ExecutionMode>,
 ) -> ModelTaskRequirements {
     let prompt = prompt.to_ascii_lowercase();
     let explicit_tool_mode = matches!(mode, Some(ExecutionMode::Focused | ExecutionMode::Agentic));
     let tool_intent = [
         "build ",
+        "build it",
+        "code it",
+        "code this",
+        "code that",
         "create ",
         "write ",
         "edit ",
@@ -2507,10 +2532,27 @@ fn model_task_requirements(
     ]
     .iter()
     .any(|marker| prompt.contains(marker));
+    let inherited_image = is_continuation_request(&prompt)
+        && history
+            .iter()
+            .rev()
+            .find(|message| message.role == MessageRole::User)
+            .is_some_and(|message| {
+                message.content.iter().any(|content| {
+                    matches!(
+                        content,
+                        MessageContent::FileReference {
+                            mime_type: Some(mime_type),
+                            ..
+                        } if mime_type.starts_with("image/")
+                    )
+                })
+            });
     ModelTaskRequirements {
         vision: attachments
             .iter()
-            .any(|attachment| attachment.kind == AttachmentKind::Image),
+            .any(|attachment| attachment.kind == AttachmentKind::Image)
+            || inherited_image,
         tools: explicit_tool_mode
             || (mode != Some(ExecutionMode::Direct)
                 && (tool_intent
@@ -2541,7 +2583,8 @@ fn model_capability_badges(model: &ModelDescriptor) -> String {
 }
 
 fn open_picker(app: &mut App, kind: PickerKind) {
-    let model_requirements = model_task_requirements(&app.editor.text, &app.attachments, app.mode);
+    let model_requirements =
+        model_task_requirements(&app.editor.text, &app.attachments, &app.messages, app.mode);
     let (title, options): (&'static str, Vec<PickerOption>) = match kind {
         PickerKind::Command => (
             " Command palette ",
@@ -3038,7 +3081,7 @@ fn submit_prompt(
         app.editor.insert_str(&value);
         return;
     };
-    let requirements = model_task_requirements(&value, &app.attachments, app.mode);
+    let requirements = model_task_requirements(&value, &app.attachments, &app.messages, app.mode);
     if app.model_pack.is_none()
         && let Some(selected) = app
             .models
@@ -3109,18 +3152,21 @@ fn submit_prompt(
     let server = server.to_string();
     let tx = tx.clone();
     tokio::spawn(async move {
-        let result = client
+        let result = match client
             .post(format!("{server}/v1/chat"))
             .json(&payload)
             .send()
             .await
-            .and_then(reqwest::Response::error_for_status);
+        {
+            Ok(response) => chat_response_result(response).await,
+            Err(error) => Err(error.to_string()),
+        };
         match result {
-            Ok(_) => {
+            Ok(()) => {
                 let _ = tx.send(ClientEvent::ChatFinished);
             }
             Err(error) => {
-                let _ = tx.send(ClientEvent::ChatFailed(error.to_string()));
+                let _ = tx.send(ClientEvent::ChatFailed(error));
             }
         }
     });
@@ -7240,11 +7286,12 @@ mod tests {
         App, AttachmentKind, ClientEvent, ModelCapabilities, ModelDescriptor,
         ModelTaskRequirements, Overlay, PROVIDER_TEMPLATES, PickerKind, PickerOption, PickerState,
         PromptEditor, SetupState, approval_decision_for_key, attachment_line, capture_editor_drop,
-        command_suggestions, complete_editor, composer_status_line, cube_loader_line,
-        dropped_files, editor_text, friendly_chat_error, handle_key, handle_slash_command,
-        latest_copyable_response, load_snapshot, model_matches_task, reasoning_levels, render,
-        render_content_block, render_content_block_with_details, render_overlay,
-        runtime_trace_lines, submit_conversation_selection, submit_prompt,
+        chat_error_message, command_suggestions, complete_editor, composer_status_line,
+        cube_loader_line, dropped_files, editor_text, friendly_chat_error, handle_key,
+        handle_slash_command, latest_copyable_response, load_snapshot, model_matches_task,
+        model_task_requirements, reasoning_levels, render, render_content_block,
+        render_content_block_with_details, render_overlay, runtime_trace_lines,
+        submit_conversation_selection, submit_prompt,
     };
     use async_trait::async_trait;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -7315,6 +7362,48 @@ mod tests {
 
         assert!(!model_matches_task(&text_only, requirements));
         assert!(model_matches_task(&vision, requirements));
+    }
+
+    #[test]
+    fn image_to_code_followup_requires_both_vision_and_tools() {
+        let conversation_id = uuid::Uuid::new_v4();
+        let history = vec![Message {
+            id: uuid::Uuid::new_v4(),
+            conversation_id,
+            run_id: None,
+            sequence: 1,
+            role: MessageRole::User,
+            content: vec![
+                MessageContent::text("Analyze this image."),
+                MessageContent::FileReference {
+                    path: "C:/fixtures/reference.png".to_string(),
+                    mime_type: Some("image/png".to_string()),
+                },
+            ],
+            provider: None,
+            model: None,
+            continuation_id: None,
+            created_at: chrono::Utc::now(),
+        }];
+        let requirements = model_task_requirements("now code it", &[], &history, None);
+        assert!(requirements.vision);
+        assert!(requirements.tools);
+    }
+
+    #[test]
+    fn structured_execution_error_is_shown_instead_of_raw_http_conflict() {
+        let message = chat_error_message(
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            Some(&serde_json::json!({
+                "error": {
+                    "code": "execution_incomplete",
+                    "message": "unchanged failed tool call was suppressed"
+                }
+            })),
+        );
+        assert!(message.contains("unchanged failed tool call was suppressed"));
+        assert!(message.contains("422 Unprocessable Entity"));
+        assert!(!message.contains("/v1/chat"));
     }
 
     #[test]

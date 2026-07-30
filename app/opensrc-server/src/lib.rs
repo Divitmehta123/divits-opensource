@@ -23,8 +23,10 @@ use opensrc_runtime::{
     AgentControlError, ChangeError, DefinitionError, ExecutionError, McpError, McpServer,
     ModeClassifier, ModelPack, ModelPackError, ModelPackStage, RequiredCapabilities, RolePolicy,
     RolePolicyDescriptor, RouterError, RoutingPolicyError, RoutingPolicySet, Runtime, SkillError,
-    ToolExecutionError, apply_role_policy, built_in_agent_definitions, discover_agent_definitions,
-    discover_custom_commands, model_is_chat_capable, resolve_agent_definition, selected_file_paths,
+    ToolExecutionError, apply_role_policy, built_in_agent_definitions, combine_request_context,
+    discover_agent_definitions, discover_custom_commands, is_continuation_request,
+    model_is_chat_capable, request_requires_mutation, resolve_agent_definition,
+    selected_file_paths,
 };
 use opensrc_store::StoreError;
 use serde::{Deserialize, Serialize};
@@ -343,7 +345,6 @@ impl IntoResponse for ApiError {
                 ExecutionError::InvalidRunState { .. }
                 | ExecutionError::MissingRootAgent(_)
                 | ExecutionError::ToolCallInFlight(_)
-                | ExecutionError::TurnLimit(_)
                 | ExecutionError::Cancelled(_)
                 | ExecutionError::Tool(
                     ToolExecutionError::Denied { .. } | ToolExecutionError::ApprovalRequired { .. },
@@ -375,6 +376,11 @@ impl IntoResponse for ApiError {
                 RoutingPolicyError::Invalid(_) | RoutingPolicyError::ModelUnavailable { .. },
             )
             | Self::Change(ChangeError::UnsafePath(_)) => StatusCode::BAD_REQUEST,
+            Self::Execution(
+                ExecutionError::TurnLimit(_)
+                | ExecutionError::IncompleteOutcome(_)
+                | ExecutionError::TaskValidationFailed(_),
+            ) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Router(RouterError::ModelDiscovery { .. })
             | Self::Execution(
                 ExecutionError::Router(RouterError::ModelDiscovery { .. })
@@ -404,6 +410,7 @@ impl IntoResponse for ApiError {
             StatusCode::BAD_REQUEST => "bad_request",
             StatusCode::NOT_FOUND => "not_found",
             StatusCode::CONFLICT => "conflict",
+            StatusCode::UNPROCESSABLE_ENTITY => "execution_incomplete",
             StatusCode::BAD_GATEWAY => "provider_error",
             _ => "internal_error",
         };
@@ -1049,7 +1056,10 @@ async fn chat(
     } else {
         None
     };
-    let routing_request = inherited_request.as_deref().unwrap_or(&request.message);
+    let routing_request = inherited_request.as_deref().map_or_else(
+        || request.message.clone(),
+        |prior| combine_request_context(&request.message, prior),
+    );
 
     let provider = request
         .provider
@@ -1061,7 +1071,7 @@ async fn chat(
         .or_else(|| conversation.model.clone())
         .or_else(|| state.runtime.providers.default_model(&provider))
         .ok_or_else(|| ApiError::BadRequest("no model is selected".to_string()))?;
-    let automatic = ModeClassifier::classify(routing_request);
+    let automatic = ModeClassifier::classify(&routing_request);
     let (mode, mode_reasons, preferred_mode) = if request.auto {
         (automatic.mode, automatic.reasons, None)
     } else if let Some(mode) = request.mode.or(conversation.preferred_mode) {
@@ -1073,7 +1083,7 @@ async fn chat(
         .agent
         .clone()
         .or_else(|| explicit_agent_name(&request.message))
-        .unwrap_or_else(|| automatic_agent_name(routing_request, mode).to_string());
+        .unwrap_or_else(|| automatic_agent_name(&routing_request, mode).to_string());
     let reasoning_level = request
         .reasoning_level
         .as_deref()
@@ -1251,7 +1261,7 @@ async fn chat(
         if let Some(policy) = role_policy.as_ref() {
             apply_role_policy(&mut definition, policy, None, &[]);
         }
-        if request_needs_mutation(routing_request) {
+        if request_requires_mutation(&routing_request) {
             ensure_mutation_capabilities(&mut definition);
         }
         if role_policy.as_ref().is_some_and(|policy| {
@@ -1410,7 +1420,7 @@ fn automatic_agent_name(message: &str, mode: ExecutionMode) -> &'static str {
     }
     let message = message.to_ascii_lowercase();
     let contains_any = |needles: &[&str]| needles.iter().any(|needle| message.contains(needle));
-    let mutation = request_needs_mutation(&message);
+    let mutation = request_requires_mutation(&message);
     if mutation
         && (contains_any(&[
             "html",
@@ -1562,68 +1572,6 @@ fn automatic_agent_name(message: &str, mode: ExecutionMode) -> &'static str {
     } else {
         "generalist"
     }
-}
-
-fn request_needs_mutation(message: &str) -> bool {
-    let mut message = message.to_ascii_lowercase();
-    for negated in [
-        "do not write",
-        "don't write",
-        "without writing",
-        "do not modify",
-        "don't modify",
-        "without modifying",
-        "do not edit",
-        "don't edit",
-        "read-only",
-        "read only",
-        "no changes",
-    ] {
-        message = message.replace(negated, "");
-    }
-    [
-        "add ",
-        "build",
-        "change the",
-        "change this",
-        "change my",
-        "create",
-        "delete",
-        "edit",
-        "fix",
-        "implement",
-        "make ",
-        "move",
-        "remove",
-        "rename",
-        "replicate",
-        "save ",
-        "update",
-        "write",
-    ]
-    .iter()
-    .any(|marker| message.contains(marker))
-}
-
-fn is_continuation_request(message: &str) -> bool {
-    let message = message.trim().to_ascii_lowercase();
-    message.len() <= 240
-        && [
-            "continue",
-            "carry on",
-            "go ahead",
-            "do it",
-            "start execution",
-            "start the execution",
-            "start implementing",
-            "proceed",
-            "finish it",
-            "complete it",
-            "as instructed",
-            "as requested",
-        ]
-        .iter()
-        .any(|marker| message.contains(marker))
 }
 
 fn ensure_mutation_capabilities(definition: &mut AgentDefinition) {
@@ -2819,7 +2767,7 @@ fn parse_id(value: &str) -> Result<uuid::Uuid, ApiError> {
 mod tests {
     use super::{
         ApiError, ConnectProviderRequest, ProviderConfigError, ProviderProtocol, ServerState,
-        automatic_agent_name, request_needs_mutation, router,
+        automatic_agent_name, router,
     };
     use async_trait::async_trait;
     use axum::body::{Body, to_bytes};
@@ -2874,6 +2822,20 @@ mod tests {
             base_url: format!("https://user:{SENTINEL_SECRET}@provider.example"),
         });
         assert!(!config_error.public_message().contains(SENTINEL_SECRET));
+    }
+
+    #[tokio::test]
+    async fn exhausted_tool_cycles_are_reported_as_incomplete_not_conflict() {
+        let response =
+            ApiError::Execution(opensrc_runtime::ExecutionError::TurnLimit(6)).into_response();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("execution error body");
+        let body = String::from_utf8(body.to_vec()).expect("UTF-8 error body");
+        assert!(body.contains("execution_incomplete"));
+        assert!(body.contains("within 6 cycles"));
+        assert!(!body.contains("\"code\":\"conflict\""));
     }
 
     struct RecordingProvider {
@@ -3192,6 +3154,18 @@ mod tests {
     }
 
     #[test]
+    fn image_analysis_to_code_transition_routes_to_a_mutating_frontend_agent() {
+        let request = opensrc_runtime::combine_request_context(
+            "now code it",
+            "Analyze this calculator screenshot and describe the UI.",
+        );
+        let mode = opensrc_runtime::ModeClassifier::classify(&request).mode;
+        assert_eq!(mode, opensrc_core::ExecutionMode::Focused);
+        assert!(opensrc_runtime::request_requires_mutation(&request));
+        assert_eq!(automatic_agent_name(&request, mode), "frontend-specialist");
+    }
+
+    #[test]
     fn routes_media_backed_implementation_to_a_writer() {
         assert_eq!(
             automatic_agent_name(
@@ -3218,13 +3192,15 @@ mod tests {
 
     #[test]
     fn negated_write_language_does_not_request_mutation() {
-        assert!(!request_needs_mutation(
+        assert!(!opensrc_runtime::request_requires_mutation(
             "Inspect the files with fs.read_many. Do not write or modify anything."
         ));
-        assert!(!request_needs_mutation(
+        assert!(!opensrc_runtime::request_requires_mutation(
             "Perform a read-only review with no changes."
         ));
-        assert!(request_needs_mutation("Write the fixed files."));
+        assert!(opensrc_runtime::request_requires_mutation(
+            "Write the fixed files."
+        ));
     }
 
     #[tokio::test]

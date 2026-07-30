@@ -132,6 +132,8 @@ pub enum ToolExecutionError {
     Patch(String),
     #[error("process timed out after {0} ms")]
     ProcessTimeout(u64),
+    #[error("process `{program}` could not start: {message}")]
+    ProcessLaunch { program: String, message: String },
     #[error("managed process error: {0}")]
     ManagedProcess(String),
     #[error("network request failed: {0}")]
@@ -235,6 +237,23 @@ impl ToolExecutor {
         &self.registry
     }
 
+    /// Converts common provider variations into the canonical tool contract.
+    ///
+    /// This normalization is provider-neutral: every model sees the same
+    /// process contract and every policy decision is made against the exact
+    /// command that will execute.
+    pub fn normalize_arguments(
+        &self,
+        name: &str,
+        arguments: Value,
+    ) -> Result<(Value, bool), ToolExecutionError> {
+        if matches!(name, "shell.run" | "shell.test" | "process.start") {
+            normalize_process_arguments(name, arguments)
+        } else {
+            Ok((arguments, false))
+        }
+    }
+
     pub async fn execute(
         &self,
         agent: &Agent,
@@ -245,6 +264,16 @@ impl ToolExecutor {
     }
 
     pub fn evaluate(
+        &self,
+        agent: &Agent,
+        name: &str,
+        arguments: &Value,
+    ) -> Result<PolicyEvaluation, ToolExecutionError> {
+        let (arguments, _) = self.normalize_arguments(name, arguments.clone())?;
+        self.evaluate_normalized(agent, name, &arguments)
+    }
+
+    fn evaluate_normalized(
         &self,
         agent: &Agent,
         name: &str,
@@ -276,7 +305,8 @@ impl ToolExecutor {
         arguments: Value,
         approval_granted: bool,
     ) -> Result<ToolExecutionResult, ToolExecutionError> {
-        let evaluation = self.evaluate(agent, name, &arguments)?;
+        let (arguments, _) = self.normalize_arguments(name, arguments)?;
+        let evaluation = self.evaluate_normalized(agent, name, &arguments)?;
         match evaluation.decision {
             PolicyDecision::Deny => {
                 return Err(ToolExecutionError::Denied {
@@ -357,7 +387,9 @@ impl ToolExecutor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let mut child = command.spawn()?;
+        let mut child = command
+            .spawn()
+            .map_err(|error| process_launch_error(&args.program, &error))?;
         let stdin = child.stdin.take();
         let stdout = child.stdout.take().ok_or_else(|| {
             ToolExecutionError::ManagedProcess("stdout pipe was unavailable".to_string())
@@ -840,12 +872,19 @@ fn builtin_descriptors() -> Vec<ToolDescriptor> {
         ),
         process_descriptor(
             "shell.run",
-            "Run a process directly without an intermediary shell.",
+            "Run a local process. Prefer `program` plus a string `args` array; use `command` only \
+             for a complete shell pipeline or built-in. Never place executable arguments inside \
+             `program`.",
         ),
-        process_descriptor("shell.test", "Run an allowlisted validation process."),
+        process_descriptor(
+            "shell.test",
+            "Run a validation process. Prefer `program` plus a string `args` array; use `command` \
+             only for a complete shell pipeline or built-in.",
+        ),
         process_descriptor(
             "process.start",
-            "Start a managed long-running process and return a process identifier.",
+            "Start a managed long-running process and return a process identifier. Prefer \
+             `program` plus a string `args` array; use `command` only for a shell pipeline.",
         ),
         process_control_descriptor(
             "process.input",
@@ -1160,12 +1199,18 @@ fn process_descriptor(name: &str, description: &str) -> ToolDescriptor {
     let schema = json!({
         "type": "object",
         "properties": {
-            "program": {"type": "string"},
+            "program": {
+                "type": "string",
+                "description": "Executable name or path only. Put each argument in args."
+            },
             "args": {"type": "array", "items": {"type": "string"}},
+            "command": {
+                "type": "string",
+                "description": "Complete shell command for pipelines or shell built-ins. Use instead of program and args."
+            },
             "cwd": {"type": "string"},
             "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 600_000}
         },
-        "required": ["program"],
         "additionalProperties": false
     });
     let writes_files = matches!(name, "shell.run" | "process.start" | "process.input");
@@ -2149,6 +2194,275 @@ struct ProcessArgs {
     timeout_ms: u64,
 }
 
+fn normalize_process_arguments(
+    tool: &str,
+    value: Value,
+) -> Result<(Value, bool), ToolExecutionError> {
+    let Value::Object(mut object) = value else {
+        return Err(invalid_process_input(
+            tool,
+            "arguments must be a JSON object",
+        ));
+    };
+    let mut changed = false;
+    if let Some((program, args)) = normalize_explicit_shell_command(tool, &mut object)? {
+        object.insert("program".to_string(), Value::String(program));
+        object.insert(
+            "args".to_string(),
+            Value::Array(args.into_iter().map(Value::String).collect()),
+        );
+        return Ok((Value::Object(object), true));
+    }
+
+    let original_program = object
+        .get("program")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            invalid_process_input(
+                tool,
+                "provide `program` with optional `args`, or provide `command`",
+            )
+        })?;
+    let mut program = original_program.trim().to_string();
+    if program.is_empty() {
+        return Err(invalid_process_input(
+            tool,
+            "`program` must be a non-empty executable name or path",
+        ));
+    }
+    if program != original_program {
+        changed = true;
+    }
+    if let Some(unquoted) = matching_unquoted_path(&program) {
+        program = unquoted;
+        changed = true;
+    }
+
+    let argument_line = match object.get("args") {
+        Some(Value::String(line)) => Some(line.trim().to_string()),
+        Some(Value::Array(values)) => {
+            if values.iter().any(|value| !value.is_string()) {
+                return Err(invalid_process_input(
+                    tool,
+                    "every item in `args` must be a string",
+                ));
+            }
+            None
+        }
+        Some(Value::Null) | None => None,
+        Some(_) => {
+            return Err(invalid_process_input(
+                tool,
+                "`args` must be an array of strings",
+            ));
+        }
+    };
+
+    let no_array_arguments = object
+        .get("args")
+        .and_then(Value::as_array)
+        .is_none_or(Vec::is_empty);
+    if argument_line.is_some() || (no_array_arguments && packed_process_program(&program)) {
+        let command_line = argument_line.map_or_else(
+            || program.clone(),
+            |line| {
+                if line.is_empty() {
+                    program.clone()
+                } else {
+                    format!("{program} {line}")
+                }
+            },
+        );
+        let (normalized_program, normalized_args) = if requires_platform_shell(&command_line) {
+            platform_shell_command(&command_line)
+        } else {
+            split_direct_command(tool, &command_line)?
+        };
+        program = normalized_program;
+        object.insert(
+            "args".to_string(),
+            Value::Array(normalized_args.into_iter().map(Value::String).collect()),
+        );
+        changed = true;
+    }
+
+    object.insert("program".to_string(), Value::String(program));
+    Ok((Value::Object(object), changed))
+}
+
+fn normalize_explicit_shell_command(
+    tool: &str,
+    object: &mut serde_json::Map<String, Value>,
+) -> Result<Option<(String, Vec<String>)>, ToolExecutionError> {
+    let Some(command) = object.remove("command") else {
+        return Ok(None);
+    };
+    let command = command
+        .as_str()
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+        .ok_or_else(|| invalid_process_input(tool, "`command` must be a non-empty string"))?;
+    if object
+        .get("program")
+        .and_then(Value::as_str)
+        .is_some_and(|program| !program.trim().is_empty())
+    {
+        return Err(invalid_process_input(
+            tool,
+            "use either `command` or `program`/`args`, not both",
+        ));
+    }
+    if object.get("args").is_some_and(|args| !args.is_null()) {
+        return Err(invalid_process_input(
+            tool,
+            "`args` cannot be combined with `command`",
+        ));
+    }
+    Ok(Some(platform_shell_command(command)))
+}
+
+fn invalid_process_input(tool: &str, message: &str) -> ToolExecutionError {
+    ToolExecutionError::InvalidInput {
+        tool: tool.to_string(),
+        message: message.to_string(),
+    }
+}
+
+fn matching_unquoted_path(program: &str) -> Option<String> {
+    let unquoted = program
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .or_else(|| {
+            program
+                .strip_prefix('\'')
+                .and_then(|value| value.strip_suffix('\''))
+        })?;
+    Path::new(unquoted).exists().then(|| unquoted.to_string())
+}
+
+fn packed_process_program(program: &str) -> bool {
+    !Path::new(program).exists()
+        && (program.chars().any(char::is_whitespace) || requires_platform_shell(program))
+}
+
+fn split_direct_command(
+    tool: &str,
+    command: &str,
+) -> Result<(String, Vec<String>), ToolExecutionError> {
+    let mut words = shell_words::split(command).map_err(|error| {
+        invalid_process_input(tool, &format!("invalid command quoting: {error}"))
+    })?;
+    if words.is_empty() {
+        return Err(invalid_process_input(tool, "command cannot be empty"));
+    }
+    let program = words.remove(0);
+    Ok((program, words))
+}
+
+fn requires_platform_shell(command: &str) -> bool {
+    if command
+        .chars()
+        .any(|character| matches!(character, '|' | '&' | ';' | '>' | '<' | '\n' | '\r'))
+    {
+        return true;
+    }
+    let first = command
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_matches(['"', '\''])
+        .to_ascii_lowercase();
+    if cfg!(windows) {
+        matches!(
+            first.as_str(),
+            "cd" | "cls"
+                | "copy"
+                | "del"
+                | "dir"
+                | "echo"
+                | "erase"
+                | "for"
+                | "if"
+                | "md"
+                | "mkdir"
+                | "mklink"
+                | "move"
+                | "path"
+                | "pause"
+                | "popd"
+                | "pushd"
+                | "rd"
+                | "ren"
+                | "rename"
+                | "rmdir"
+                | "set"
+                | "start"
+                | "type"
+                | "ver"
+                | "ls"
+                | "cat"
+                | "cp"
+                | "mv"
+                | "pwd"
+                | "rm"
+        )
+    } else {
+        matches!(
+            first.as_str(),
+            "alias" | "cd" | "export" | "read" | "set" | "source" | "umask" | "unset"
+        )
+    }
+}
+
+fn platform_shell_command(command: &str) -> (String, Vec<String>) {
+    if cfg!(windows) {
+        let use_cmd = command.contains("&&")
+            || command.contains("||")
+            || command.split_whitespace().next().is_some_and(|first| {
+                matches!(
+                    first.to_ascii_lowercase().as_str(),
+                    "copy"
+                        | "del"
+                        | "dir"
+                        | "erase"
+                        | "md"
+                        | "mkdir"
+                        | "mklink"
+                        | "rd"
+                        | "ren"
+                        | "rename"
+                        | "rmdir"
+                )
+            });
+        if use_cmd {
+            return (
+                "cmd.exe".to_string(),
+                vec![
+                    "/D".to_string(),
+                    "/S".to_string(),
+                    "/C".to_string(),
+                    command.to_string(),
+                ],
+            );
+        }
+        (
+            "powershell.exe".to_string(),
+            vec![
+                "-NoLogo".to_string(),
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-Command".to_string(),
+                command.to_string(),
+            ],
+        )
+    } else {
+        (
+            "/bin/sh".to_string(),
+            vec!["-lc".to_string(), command.to_string()],
+        )
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ProcessInputArgs {
     process_id: String,
@@ -2405,7 +2719,8 @@ async fn execute_process(
         command.output(),
     )
     .await
-    .map_err(|_| ToolExecutionError::ProcessTimeout(timeout_ms))??;
+    .map_err(|_| ToolExecutionError::ProcessTimeout(timeout_ms))?
+    .map_err(|error| process_launch_error(program, &error))?;
     let stdout = truncate_bytes(&output.stdout, DEFAULT_MAX_OUTPUT_BYTES);
     let stderr = truncate_bytes(&output.stderr, DEFAULT_MAX_OUTPUT_BYTES);
     Ok(json!({
@@ -2416,6 +2731,20 @@ async fn execute_process(
         "stderr": stderr.0,
         "stderr_truncated": stderr.1
     }))
+}
+
+fn process_launch_error(program: &str, error: &std::io::Error) -> ToolExecutionError {
+    let message = if error.kind() == std::io::ErrorKind::NotFound {
+        "executable was not found on PATH; use a canonical filesystem tool, provide a valid \
+         executable, or put a shell built-in/pipeline in `command`"
+            .to_string()
+    } else {
+        error.to_string()
+    };
+    ToolExecutionError::ProcessLaunch {
+        program: program.to_string(),
+        message,
+    }
 }
 
 fn restricted_command(
@@ -2882,6 +3211,122 @@ mod tests {
         };
         assert_eq!(registry.visible_for(&policy).len(), 1);
         assert_eq!(registry.visible_for(&policy)[0].name, "fs.read");
+    }
+
+    #[test]
+    fn process_arguments_normalize_packed_commands_for_every_provider() {
+        let executor = ToolExecutor::default();
+        let (arguments, changed) = executor
+            .normalize_arguments(
+                "shell.run",
+                json!({
+                    "program": "cargo test --workspace",
+                    "cwd": "."
+                }),
+            )
+            .expect("packed command");
+        assert!(changed);
+        assert_eq!(arguments["program"], "cargo");
+        assert_eq!(arguments["args"], json!(["test", "--workspace"]));
+
+        let (arguments, changed) = executor
+            .normalize_arguments(
+                "shell.run",
+                json!({
+                    "program": "cargo",
+                    "args": "test --all-targets",
+                    "cwd": "."
+                }),
+            )
+            .expect("string arguments");
+        assert!(changed);
+        assert_eq!(arguments["program"], "cargo");
+        assert_eq!(arguments["args"], json!(["test", "--all-targets"]));
+    }
+
+    #[test]
+    fn explicit_shell_commands_use_the_platform_shell_contract() {
+        let executor = ToolExecutor::default();
+        let (arguments, changed) = executor
+            .normalize_arguments(
+                "shell.run",
+                json!({
+                    "command": "echo ready | echo complete",
+                    "cwd": "."
+                }),
+            )
+            .expect("shell command");
+        assert!(changed);
+        if cfg!(windows) {
+            assert!(
+                matches!(
+                    arguments["program"].as_str(),
+                    Some("cmd.exe" | "powershell.exe")
+                ),
+                "{arguments}"
+            );
+        } else {
+            assert_eq!(arguments["program"], "/bin/sh");
+        }
+        assert!(
+            arguments["args"]
+                .as_array()
+                .expect("shell arguments")
+                .iter()
+                .any(|value| value == "echo ready | echo complete")
+        );
+        assert!(arguments.get("command").is_none());
+    }
+
+    #[test]
+    fn malformed_process_arguments_fail_before_launch() {
+        let executor = ToolExecutor::default();
+        let error = executor
+            .normalize_arguments("shell.run", json!({"program": "", "args": []}))
+            .expect_err("empty program");
+        assert!(error.to_string().contains("non-empty executable"));
+
+        let error = executor
+            .normalize_arguments(
+                "shell.run",
+                json!({"program": "cargo", "command": "cargo test"}),
+            )
+            .expect_err("ambiguous command");
+        assert!(error.to_string().contains("either `command` or `program`"));
+    }
+
+    #[tokio::test]
+    async fn normalized_shell_command_executes_after_approval() {
+        let workspace =
+            std::env::temp_dir().join(format!("opensrc-shell-normalize-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let agent = test_agent(
+            &workspace.to_string_lossy(),
+            ToolPolicy {
+                allow: vec!["shell.run".to_string()],
+                deny: Vec::new(),
+                may_spawn_children: false,
+            },
+        );
+        let result = ToolExecutor::default()
+            .execute_approved(
+                &agent,
+                "shell.run",
+                json!({
+                    "command": "echo normalized-shell-command",
+                    "cwd": "."
+                }),
+            )
+            .await
+            .expect("normalized shell command");
+        assert!(
+            result.output["stdout"]
+                .as_str()
+                .is_some_and(|stdout| stdout.contains("normalized-shell-command")),
+            "{}",
+            result.output
+        );
+        std::fs::remove_dir_all(workspace).expect("cleanup");
     }
 
     #[test]

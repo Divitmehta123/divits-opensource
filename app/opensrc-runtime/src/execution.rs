@@ -4,7 +4,8 @@ use crate::{
     ModelPackMember, ModelPackRegistry, ModelPackStage, ProviderRouter, RequiredCapabilities,
     ResolvedModelAssignment, RoleExecutionKind, RouterError, RoutingPolicyError,
     RoutingPolicyRegistry, SkillRegistry, ToolDescriptor, ToolExecutionError, ToolExecutionResult,
-    ToolExecutor, apply_role_policy, built_in_agent_definitions, resolve_agent_definition,
+    ToolExecutor, apply_role_policy, built_in_agent_definitions, combine_request_context,
+    is_continuation_request, request_requires_mutation, resolve_agent_definition,
     selected_file_paths,
 };
 use chrono::Utc;
@@ -781,6 +782,7 @@ impl ExecutionEngine {
         let mut tests_run = Vec::new();
         let mut test_evidence = Vec::new();
         let mut unresolved = Vec::new();
+        let mut non_retryable_tool_failures = BTreeMap::<String, String>::new();
         let mut mailbox_cursor = 0_i64;
 
         for cycle in 0..maximum_cycles {
@@ -895,6 +897,32 @@ impl ExecutionEngine {
                             )),
                         )?;
                     }
+                }
+            }
+            for (call_id, name, arguments) in &mut calls {
+                if let Ok((normalized, true)) =
+                    self.tools.normalize_arguments(name, arguments.clone())
+                {
+                    let provider_arguments = arguments.clone();
+                    *arguments = normalized;
+                    self.store.append_event(
+                        run_id,
+                        Some(agent.id),
+                        task_id,
+                        "runtime.tool_arguments_normalized",
+                        &json!({
+                            "cycle": cycle,
+                            "call_id": call_id,
+                            "name": name,
+                            "provider_arguments": provider_arguments,
+                            "canonical_arguments": arguments,
+                            "reason": "canonical cross-provider tool contract",
+                        }),
+                        Some(&format!(
+                            "{run_id}:{}:{call_id}:normalized-arguments",
+                            agent.id
+                        )),
+                    )?;
                 }
             }
             if calls.is_empty() && compatibility_profile.materializes_filename_labeled_code() {
@@ -1324,6 +1352,7 @@ impl ExecutionEngine {
                 tool_calls += 1;
                 let tool_started = Instant::now();
                 let target = tool_target_summary(&name, &arguments);
+                let signature = tool_call_signature(&name, &arguments);
                 self.store.append_event(
                     run_id,
                     Some(agent.id),
@@ -1337,6 +1366,56 @@ impl ExecutionEngine {
                     }),
                     Some(&format!("{run_id}:{}:{call_id}:started", agent.id)),
                 )?;
+                if let Some(previous_error) = non_retryable_tool_failures.get(&signature) {
+                    let error = format!(
+                        "unchanged failed tool call suppressed: {previous_error}. Correct the \
+                         arguments, choose a different executable, or use the canonical \
+                         filesystem/patch tools instead of retrying the same call."
+                    );
+                    self.store.append_event(
+                        run_id,
+                        Some(agent.id),
+                        task_id,
+                        "runtime.duplicate_failed_tool_call_suppressed",
+                        &json!({
+                            "cycle": cycle,
+                            "call_id": call_id,
+                            "name": name,
+                            "target": target,
+                            "previous_error": previous_error,
+                        }),
+                        Some(&format!(
+                            "{run_id}:{}:{call_id}:duplicate-failure",
+                            agent.id
+                        )),
+                    )?;
+                    self.store.append_event(
+                        run_id,
+                        Some(agent.id),
+                        task_id,
+                        "tool.completed",
+                        &json!({
+                            "cycle": cycle,
+                            "call_id": call_id,
+                            "name": name,
+                            "target": target,
+                            "status": "suppressed",
+                            "elapsed_ms": elapsed_ms(tool_started),
+                        }),
+                        Some(&format!(
+                            "{run_id}:{}:{call_id}:duplicate-failure-event",
+                            agent.id
+                        )),
+                    )?;
+                    results.push(json!({
+                        "call_id": call_id,
+                        "tool": name,
+                        "arguments": arguments,
+                        "approval_state": "not_repeated",
+                        "result": {"error": error}
+                    }));
+                    continue;
+                }
                 let descriptor = self
                     .tools
                     .registry()
@@ -1358,8 +1437,9 @@ impl ExecutionEngine {
                         output["error"].as_str().unwrap_or("unavailable tool")
                     );
                     if !unresolved.contains(&issue) {
-                        unresolved.push(issue);
+                        unresolved.push(issue.clone());
                     }
+                    non_retryable_tool_failures.insert(signature, issue);
                     self.store.append_event(
                         run_id,
                         Some(agent.id),
@@ -1400,7 +1480,63 @@ impl ExecutionEngine {
                     }));
                     continue;
                 };
-                let evaluation = self.tools.evaluate(&agent, &name, &arguments)?;
+                let evaluation = match self.tools.evaluate(&agent, &name, &arguments) {
+                    Ok(evaluation) => evaluation,
+                    Err(error) => {
+                        let error = error.to_string();
+                        let issue = format!("{name}: {error}");
+                        if !unresolved.contains(&issue) {
+                            unresolved.push(issue.clone());
+                        }
+                        non_retryable_tool_failures.insert(signature, issue);
+                        self.store.append_event(
+                            run_id,
+                            Some(agent.id),
+                            task_id,
+                            "runtime.tool_call_rejected",
+                            &json!({
+                                "cycle": cycle,
+                                "call_id": call_id,
+                                "name": name,
+                                "reason": "invalid_arguments",
+                                "error": error,
+                            }),
+                            Some(&format!(
+                                "{run_id}:{}:{call_id}:invalid-arguments",
+                                agent.id
+                            )),
+                        )?;
+                        self.store.append_event(
+                            run_id,
+                            Some(agent.id),
+                            task_id,
+                            "tool.completed",
+                            &json!({
+                                "cycle": cycle,
+                                "call_id": call_id,
+                                "name": name,
+                                "target": target,
+                                "status": "failed",
+                                "elapsed_ms": elapsed_ms(tool_started),
+                            }),
+                            Some(&format!(
+                                "{run_id}:{}:{call_id}:invalid-arguments-event",
+                                agent.id
+                            )),
+                        )?;
+                        results.push(json!({
+                            "call_id": call_id,
+                            "tool": name,
+                            "arguments": arguments,
+                            "approval_state": "invalid_arguments",
+                            "result": {
+                                "error": error,
+                                "recovery": "Correct the arguments and retry, or choose a canonical filesystem/patch tool."
+                            }
+                        }));
+                        continue;
+                    }
+                };
                 let key = format!("{run_id}:{}:{call_id}", agent.id);
                 let mut effective_arguments = arguments.clone();
                 let mut approval_state = "not_required".to_string();
@@ -1668,6 +1804,11 @@ impl ExecutionEngine {
                     let issue = format!("{name}: {error}");
                     if !unresolved.contains(&issue) {
                         unresolved.push(issue);
+                    }
+                    if non_retryable_tool_error(error) {
+                        non_retryable_tool_failures
+                            .entry(signature)
+                            .or_insert_with(|| error.to_string());
                     }
                 }
                 self.store.append_event(
@@ -5537,6 +5678,32 @@ fn tool_target_summary(name: &str, arguments: &Value) -> String {
     name.to_string()
 }
 
+fn tool_call_signature(name: &str, arguments: &Value) -> String {
+    format!(
+        "{name}:{}",
+        serde_json::to_string(arguments).unwrap_or_else(|_| arguments.to_string())
+    )
+}
+
+fn non_retryable_tool_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    [
+        "invalid input",
+        "program not found",
+        "executable was not found",
+        "not registered",
+        "is unavailable for this task",
+        "unsafe workspace path",
+        "access is outside",
+        "permission denied",
+        "was denied",
+        "missing field",
+        "unknown field",
+    ]
+    .iter()
+    .any(|marker| error.contains(marker))
+}
+
 fn native_media_tool_reference(
     agent: &Agent,
     name: &str,
@@ -5589,7 +5756,7 @@ fn effective_execution_objective(current_request: &str, messages: &[CanonicalMes
             continue;
         }
         if !text.is_empty() && !is_continuation_request(&text) {
-            return text;
+            return combine_request_context(current_request, &text);
         }
     }
     current_request.trim().to_string()
@@ -5630,68 +5797,6 @@ fn relevant_image_references(
         }
     }
     Vec::new()
-}
-
-fn is_continuation_request(request: &str) -> bool {
-    let request = request.trim().to_ascii_lowercase();
-    request.len() <= 240
-        && [
-            "continue",
-            "carry on",
-            "go ahead",
-            "do it",
-            "start execution",
-            "start the execution",
-            "start implementing",
-            "proceed",
-            "finish it",
-            "complete it",
-            "as instructed",
-            "as requested",
-        ]
-        .iter()
-        .any(|marker| request.contains(marker))
-}
-
-fn request_requires_mutation(request: &str) -> bool {
-    let mut request = request.to_ascii_lowercase();
-    for negated in [
-        "do not write",
-        "don't write",
-        "without writing",
-        "do not modify",
-        "don't modify",
-        "without modifying",
-        "do not edit",
-        "don't edit",
-        "read-only",
-        "read only",
-        "no changes",
-    ] {
-        request = request.replace(negated, "");
-    }
-    [
-        "add ",
-        "build",
-        "change the",
-        "change this",
-        "change my",
-        "create",
-        "delete",
-        "edit",
-        "fix",
-        "implement",
-        "make ",
-        "move",
-        "remove",
-        "rename",
-        "replicate",
-        "save ",
-        "update",
-        "write",
-    ]
-    .iter()
-    .any(|marker| request.contains(marker))
 }
 
 fn is_mutation_tool(name: &str) -> bool {
@@ -6656,10 +6761,11 @@ mod tests {
     use super::{
         ExecutionEngine, SkillInstallToolArgs, compacted_history, contextual_visible_tools,
         deterministic_directory_inventory_target, directory_inventory_answer,
-        explicit_artifact_paths, extract_materializable_artifacts, install_skill,
-        missing_explicit_artifact_paths, native_media_tool_reference, normalize_github_skill_url,
-        normalize_provider_write_call, parse_agentic_plan, provider_retry_wait_ms,
-        reconcile_materializable_artifacts, request_requires_mutation,
+        effective_execution_objective, explicit_artifact_paths, extract_materializable_artifacts,
+        install_skill, missing_explicit_artifact_paths, native_media_tool_reference,
+        non_retryable_tool_error, normalize_github_skill_url, normalize_provider_write_call,
+        parse_agentic_plan, provider_retry_wait_ms, reconcile_materializable_artifacts,
+        relevant_image_references, request_requires_mutation,
     };
     use crate::{
         AgentControl, AgentLimits, ChangeManager, ExecutionError, ModelPackRegistry,
@@ -6667,7 +6773,7 @@ mod tests {
     };
     use async_trait::async_trait;
     use opensrc_core::{
-        AgentDefinition, AgentStatus, ApprovalDecision, ApprovalStatus, Budgets,
+        AgentDefinition, AgentStatus, ApprovalDecision, ApprovalStatus, Budgets, CanonicalMessage,
         CanonicalModelRequest, ContextPolicy, ExecutionMode, Message, MessageContent, MessageRole,
         ModelEvent, ProviderAdapter, ProviderCapabilities, ProviderError, ReasoningConfig,
         RetryPolicy, ReviewContract, ReviewFinding, ReviewSeverity, ReviewVerdict, RunStatus,
@@ -6785,6 +6891,50 @@ mod tests {
             .is_empty()
         );
         assert!(request_requires_mutation("Write the requested files."));
+    }
+
+    #[test]
+    fn image_to_code_followup_inherits_visual_context_and_mutation_objective() {
+        let image = MessageContent::FileReference {
+            path: "C:/fixtures/calculator.png".to_string(),
+            mime_type: Some("image/png".to_string()),
+        };
+        let messages = vec![
+            CanonicalMessage {
+                role: MessageRole::User,
+                content: vec![
+                    MessageContent::text("Analyze this calculator screenshot."),
+                    image.clone(),
+                ],
+            },
+            CanonicalMessage::text(MessageRole::Assistant, "The image is a calculator."),
+            CanonicalMessage::text(MessageRole::User, "now code it"),
+        ];
+
+        let objective = effective_execution_objective("now code it", &messages);
+        assert!(objective.contains("Analyze this calculator screenshot."));
+        assert!(objective.contains("Follow-up instruction: now code it"));
+        assert!(request_requires_mutation(&objective));
+        assert_eq!(
+            relevant_image_references(&messages, "now code it"),
+            vec![image]
+        );
+    }
+
+    #[test]
+    fn only_non_retryable_tool_failures_are_suppressed() {
+        assert!(non_retryable_tool_error(
+            "process `missing` could not start: executable was not found on PATH"
+        ));
+        assert!(non_retryable_tool_error(
+            "invalid input for tool `shell.run`: missing field `program`"
+        ));
+        assert!(!non_retryable_tool_error(
+            "network request failed: connection reset"
+        ));
+        assert!(!non_retryable_tool_error(
+            "process timed out after 30000 ms"
+        ));
     }
 
     #[test]
@@ -7976,6 +8126,51 @@ document.title = "Calculator";
         }
     }
 
+    struct RepeatedInvalidToolThenFinalProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ProviderAdapter for RepeatedInvalidToolThenFinalProvider {
+        fn id(&self) -> &'static str {
+            "repeat-invalid-mock"
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                supports_tool_calls: true,
+                ..ProviderCapabilities::default()
+            }
+        }
+
+        async fn execute(
+            &self,
+            _request: CanonicalModelRequest,
+        ) -> Result<Vec<ModelEvent>, ProviderError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call < 2 {
+                return Ok(vec![
+                    ModelEvent::ToolCall {
+                        id: format!("invalid-read-{call}"),
+                        name: "fs.read".to_string(),
+                        arguments: json!({"max_bytes": 1024}),
+                    },
+                    ModelEvent::Completed {
+                        response_id: Some(format!("invalid-turn-{call}")),
+                    },
+                ]);
+            }
+            Ok(vec![
+                ModelEvent::TextDelta {
+                    text: "Recovered after the invalid duplicate was suppressed.".to_string(),
+                },
+                ModelEvent::Completed {
+                    response_id: Some("recovered-final".to_string()),
+                },
+            ])
+        }
+    }
+
     #[tokio::test]
     async fn executes_direct_run_without_creating_an_agent() {
         let store = Store::in_memory().expect("store");
@@ -8151,6 +8346,76 @@ document.title = "Calculator";
             messages[2].content.first(),
             Some(MessageContent::ToolResult { name, .. }) if name == "fs.read"
         ));
+        std::fs::remove_dir_all(workspace).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn repeated_invalid_tool_call_is_suppressed_without_another_execution() {
+        let workspace = std::env::temp_dir().join(format!("opensrc-tool-loop-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let store = Store::in_memory().expect("store");
+        let conversation = store
+            .create_conversation(workspace.to_string_lossy(), None)
+            .expect("conversation");
+        let run = store
+            .create_run(
+                conversation.id,
+                "inspect the workspace",
+                ExecutionMode::Focused,
+            )
+            .expect("run");
+        let mut definition = crate::built_in_agent_definition("investigator").expect("definition");
+        definition.tool_policy = ToolPolicy {
+            allow: vec!["fs.read".to_string()],
+            deny: Vec::new(),
+            may_spawn_children: false,
+        };
+        definition.budgets.turn_limit = Some(4);
+        AgentControl::new(store.clone(), AgentLimits::default())
+            .create_root(
+                run.id,
+                &definition,
+                "inspect the workspace",
+                workspace.to_string_lossy(),
+            )
+            .expect("root");
+        let provider = Arc::new(RepeatedInvalidToolThenFinalProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let router = ProviderRouter::default();
+        router.register(provider.clone());
+        let engine = ExecutionEngine::new(store.clone(), Arc::new(router), ToolExecutor::default());
+
+        let result = engine
+            .execute_run(run.id, "repeat-invalid-mock", "mock-model")
+            .await
+            .expect("recovered run");
+
+        assert_eq!(
+            result.output,
+            "Recovered after the invalid duplicate was suppressed."
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+        let events = store.events_after(0, 200).expect("events");
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "runtime.duplicate_failed_tool_call_suppressed")
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.kind == "tool.completed"
+                        && event.payload["status"].as_str() == Some("failed")
+                })
+                .count(),
+            1,
+            "the duplicate must not execute a second time"
+        );
+        assert!(events.iter().any(|event| {
+            event.kind == "tool.completed" && event.payload["status"].as_str() == Some("suppressed")
+        }));
         std::fs::remove_dir_all(workspace).expect("cleanup");
     }
 
