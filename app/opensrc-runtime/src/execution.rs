@@ -435,6 +435,25 @@ impl ExecutionEngine {
         } else {
             history
         };
+        let requires_multimodal = direct_history.iter().any(|message| {
+            message.content.iter().any(|content| {
+                matches!(
+                    content,
+                    MessageContent::FileReference {
+                        mime_type: Some(mime_type),
+                        ..
+                    } if mime_type.starts_with("image/")
+                )
+            })
+        });
+        self.providers.resolve_model(
+            provider,
+            model,
+            &RequiredCapabilities {
+                multimodal: requires_multimodal,
+                ..RequiredCapabilities::default()
+            },
+        )?;
         let request = CanonicalModelRequest {
             model: model.to_string(),
             system: "Answer directly and concisely. Do not claim to have used local tools."
@@ -528,10 +547,23 @@ impl ExecutionEngine {
             provider,
             user_request,
         );
-        let adapter = self.providers.resolve(
+        let requires_multimodal = history.iter().any(|message| {
+            message.content.iter().any(|content| {
+                matches!(
+                    content,
+                    MessageContent::FileReference {
+                        mime_type: Some(mime_type),
+                        ..
+                    } if mime_type.starts_with("image/")
+                )
+            })
+        });
+        let adapter = self.providers.resolve_model(
             provider,
+            model,
             &RequiredCapabilities {
                 tools: !visible_tools.is_empty(),
+                multimodal: requires_multimodal,
                 ..RequiredCapabilities::default()
             },
         )?;
@@ -7172,6 +7204,7 @@ console.log("ready");
 
     struct FixedProvider;
 
+    #[cfg(windows)]
     struct ShouldNotCallProvider;
 
     struct MailboxProvider {
@@ -7380,6 +7413,7 @@ console.log("ready");
         }
     }
 
+    #[cfg(windows)]
     #[async_trait]
     impl ProviderAdapter for ShouldNotCallProvider {
         fn id(&self) -> &'static str {

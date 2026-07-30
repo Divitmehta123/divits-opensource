@@ -21,10 +21,10 @@ use opensrc_providers::{
 };
 use opensrc_runtime::{
     AgentControlError, ChangeError, DefinitionError, ExecutionError, McpError, McpServer,
-    ModeClassifier, ModelPack, ModelPackError, ModelPackStage, RolePolicy, RolePolicyDescriptor,
-    RouterError, RoutingPolicyError, RoutingPolicySet, Runtime, SkillError, ToolExecutionError,
-    apply_role_policy, built_in_agent_definitions, discover_agent_definitions,
-    discover_custom_commands, resolve_agent_definition, selected_file_paths,
+    ModeClassifier, ModelPack, ModelPackError, ModelPackStage, RequiredCapabilities, RolePolicy,
+    RolePolicyDescriptor, RouterError, RoutingPolicyError, RoutingPolicySet, Runtime, SkillError,
+    ToolExecutionError, apply_role_policy, built_in_agent_definitions, discover_agent_definitions,
+    discover_custom_commands, model_is_chat_capable, resolve_agent_definition, selected_file_paths,
 };
 use opensrc_store::StoreError;
 use serde::{Deserialize, Serialize};
@@ -1166,6 +1166,23 @@ async fn chat(
         &request.message,
         &request.attachments,
     )?;
+    let requires_vision = attachments.iter().any(|attachment| {
+        matches!(
+            attachment,
+            MessageContent::FileReference {
+                mime_type: Some(mime_type),
+                ..
+            } if mime_type.starts_with("image/")
+        )
+    });
+    state.runtime.providers.resolve_model(
+        &provider,
+        &model,
+        &RequiredCapabilities {
+            multimodal: requires_vision,
+            ..RequiredCapabilities::default()
+        },
+    )?;
     let attachment_paths = attachments
         .iter()
         .filter_map(|content| match content {
@@ -1704,6 +1721,30 @@ struct ModelQuery {
     refresh: bool,
 }
 
+fn model_descriptor(
+    state: &ServerState,
+    provider: &str,
+    model: &str,
+    source: &'static str,
+) -> Value {
+    let chat = model_is_chat_capable(model);
+    let capabilities = state
+        .runtime
+        .providers
+        .capabilities_for_model(provider, model)
+        .unwrap_or_default();
+    json!({
+        "provider": provider,
+        "id": model,
+        "source": source,
+        "capabilities": {
+            "chat": chat,
+            "tools": capabilities.supports_tool_calls,
+            "multimodal": capabilities.supports_multimodal_input
+        }
+    })
+}
+
 async fn list_models(
     State(state): State<ServerState>,
     Query(query): Query<ModelQuery>,
@@ -1738,12 +1779,14 @@ async fn list_models(
         };
         if discovered.is_empty() {
             if let Some(model) = descriptor.default_model {
-                models.push(json!({"provider": descriptor.id, "id": model, "source": "default"}));
+                models.push(model_descriptor(&state, &descriptor.id, &model, "default"));
             }
         } else {
-            models.extend(discovered.into_iter().map(
-                |model| json!({"provider": descriptor.id, "id": model, "source": "discovered"}),
-            ));
+            models.extend(
+                discovered
+                    .into_iter()
+                    .map(|model| model_descriptor(&state, &descriptor.id, &model, "discovered")),
+            );
         }
     }
     Ok(Json(json!({
@@ -2242,7 +2285,7 @@ fn standard_provider_capabilities(protocol: &ProviderProtocol) -> ProviderCapabi
         supports_previous_response_continuation: false,
         supports_context_reuse: false,
         supports_native_token_counting: true,
-        supports_multimodal_input: true,
+        supports_multimodal_input: matches!(protocol, ProviderProtocol::Gemini),
         supports_thought_signatures: false,
         supports_batch_requests: false,
     }
@@ -2846,6 +2889,7 @@ mod tests {
         fn capabilities(&self) -> ProviderCapabilities {
             ProviderCapabilities {
                 supports_streaming: true,
+                supports_multimodal_input: true,
                 ..ProviderCapabilities::default()
             }
         }

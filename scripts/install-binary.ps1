@@ -27,8 +27,12 @@ if ($installDirectory -notin $entries) {
         'User'
     )
 }
+$processEntries = @($env:Path -split ';' | Where-Object { $_ })
+if ($installDirectory -notin $processEntries) {
+    $env:Path = "$installDirectory;$env:Path"
+}
 
 Write-Host ''
 Write-Host "Divit's OpenSource Tool was installed."
-Write-Host 'Open a new Command Prompt in any folder and run:'
+Write-Host 'Run this now from any folder:'
 Write-Host '  divit'

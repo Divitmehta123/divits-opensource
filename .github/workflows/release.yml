@@ -22,7 +22,7 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             archive: divits-opensource-macos-arm64.tar.gz
-          - os: macos-13
+          - os: macos-14
             target: x86_64-apple-darwin
             archive: divits-opensource-macos-x64.tar.gz
     runs-on: ${{ matrix.os }}
@@ -64,7 +64,11 @@ jobs:
           cp scripts/install.sh app/LICENSE README.md dist/
           chmod +x dist/divit dist/install.sh
           tar -C dist -czf "${{ matrix.archive }}" .
-          sha256sum "${{ matrix.archive }}" > "${{ matrix.archive }}.sha256"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${{ matrix.archive }}" > "${{ matrix.archive }}.sha256"
+          else
+            shasum -a 256 "${{ matrix.archive }}" > "${{ matrix.archive }}.sha256"
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.archive }}

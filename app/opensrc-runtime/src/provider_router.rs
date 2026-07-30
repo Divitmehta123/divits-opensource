@@ -180,6 +180,49 @@ impl ProviderRouter {
         Ok(adapter)
     }
 
+    pub fn capabilities_for_model(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Result<ProviderCapabilities, RouterError> {
+        let adapter = self
+            .adapters
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(provider)
+            .cloned()
+            .ok_or_else(|| RouterError::UnknownProvider(provider.to_string()))?;
+        let mut capabilities = adapter.capabilities();
+        capabilities.supports_multimodal_input = model_supports_multimodal_input(
+            provider,
+            model,
+            capabilities.supports_multimodal_input,
+        );
+        capabilities.supports_tool_calls = capabilities.supports_tool_calls
+            && model_supports_local_tools(provider, model)
+            && model_is_chat_capable(model);
+        capabilities.supports_parallel_tool_calls &= capabilities.supports_tool_calls;
+        Ok(capabilities)
+    }
+
+    pub fn resolve_model(
+        &self,
+        provider: &str,
+        model: &str,
+        required: &RequiredCapabilities,
+    ) -> Result<Arc<dyn ProviderAdapter>, RouterError> {
+        let adapter = self
+            .adapters
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(provider)
+            .cloned()
+            .ok_or_else(|| RouterError::UnknownProvider(provider.to_string()))?;
+        let capabilities = self.capabilities_for_model(provider, model)?;
+        validate_capabilities(provider, &capabilities, required)?;
+        Ok(adapter)
+    }
+
     pub async fn list_models(&self, provider: &str) -> Result<Vec<String>, RouterError> {
         let adapter = self.resolve(provider, &RequiredCapabilities::default())?;
         let mut models =
@@ -201,6 +244,64 @@ impl ProviderRouter {
             .insert(provider.to_string(), models.clone());
         Ok(models)
     }
+}
+
+#[must_use]
+pub fn model_is_chat_capable(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    ![
+        "whisper",
+        "orpheus",
+        "prompt-guard",
+        "safeguard",
+        "embedding",
+        "moderation",
+        "text-to-speech",
+        "speech-to-text",
+        "/tts",
+    ]
+    .iter()
+    .any(|marker| model.contains(marker))
+}
+
+fn model_supports_local_tools(provider: &str, model: &str) -> bool {
+    let provider = provider.to_ascii_lowercase();
+    let model = model.to_ascii_lowercase();
+    !(provider == "groq" && matches!(model.as_str(), "groq/compound" | "groq/compound-mini"))
+}
+
+fn model_supports_multimodal_input(provider: &str, model: &str, provider_default: bool) -> bool {
+    let provider = provider.to_ascii_lowercase();
+    let model = model.to_ascii_lowercase();
+    if provider == "groq" {
+        return model.contains("qwen3.6")
+            || model.contains("qwen3-vl")
+            || model.contains("qwen3_vl");
+    }
+    provider_default
+        || [
+            "vision",
+            "llava",
+            "pixtral",
+            "qwen-vl",
+            "qwen_vl",
+            "qwen3-vl",
+            "qwen3_vl",
+            "qwen3.6",
+            "gemini",
+            "gpt-4o",
+            "gpt-4.1",
+            "gpt-5",
+            "o3",
+            "o4",
+            "claude-3",
+            "claude-sonnet-4",
+            "claude-opus-4",
+            "llama-4-scout",
+            "llama-4-maverick",
+        ]
+        .iter()
+        .any(|marker| model.contains(marker))
 }
 
 fn validate_capabilities(
@@ -234,4 +335,31 @@ fn validate_capabilities(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        model_is_chat_capable, model_supports_local_tools, model_supports_multimodal_input,
+    };
+
+    #[test]
+    fn groq_models_are_filtered_by_their_actual_task_capabilities() {
+        assert!(!model_supports_multimodal_input(
+            "groq",
+            "llama-3.3-70b-versatile",
+            true
+        ));
+        assert!(model_supports_multimodal_input(
+            "groq",
+            "qwen/qwen3.6-27b",
+            false
+        ));
+        assert!(model_supports_local_tools(
+            "groq",
+            "llama-3.3-70b-versatile"
+        ));
+        assert!(!model_supports_local_tools("groq", "groq/compound"));
+        assert!(!model_is_chat_capable("whisper-large-v3"));
+    }
 }

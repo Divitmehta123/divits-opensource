@@ -8,15 +8,15 @@ server and a durable SQLite conversation/event store.
 
 ### Windows: one download command (no Rust required)
 
-After the repository is published, anyone can install the latest signed release with one
-PowerShell command:
+Anyone can install the latest native release with one PowerShell command:
 
 ```powershell
 irm https://raw.githubusercontent.com/Divitmehta123/divits-opensource/main/scripts/install-online.ps1 | iex
 ```
 
 The bootstrap downloads the newest Windows release, verifies its SHA-256 checksum, installs it,
-and adds the launcher to the user's PATH. Then, in any new terminal:
+and adds the launcher to both the current session and the user's PATH. No Rust, Cargo, Python,
+Node.js, Git, or administrator access is required. Run it immediately:
 
 ```text
 divit

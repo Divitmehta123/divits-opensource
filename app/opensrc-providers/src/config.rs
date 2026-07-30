@@ -182,7 +182,7 @@ fn default_capabilities(protocol: &ProviderProtocol) -> ProviderCapabilities {
         supports_previous_response_continuation: false,
         supports_context_reuse: false,
         supports_native_token_counting: true,
-        supports_multimodal_input: true,
+        supports_multimodal_input: matches!(protocol, ProviderProtocol::Gemini),
         supports_thought_signatures: false,
         supports_batch_requests: false,
     }

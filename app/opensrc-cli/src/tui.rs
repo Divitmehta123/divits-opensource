@@ -517,6 +517,32 @@ struct ProviderPage {
 struct ModelDescriptor {
     provider: String,
     id: String,
+    #[serde(default)]
+    capabilities: ModelCapabilities,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ModelCapabilities {
+    #[serde(default = "default_true")]
+    chat: bool,
+    #[serde(default)]
+    tools: bool,
+    #[serde(default)]
+    multimodal: bool,
+}
+
+impl Default for ModelCapabilities {
+    fn default() -> Self {
+        Self {
+            chat: true,
+            tools: false,
+            multimodal: false,
+        }
+    }
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -1810,6 +1836,7 @@ fn handle_client_event(app: &mut App, event: ClientEvent) {
                 app.models.push(ModelDescriptor {
                     provider: provider.clone(),
                     id: model.clone(),
+                    capabilities: ModelCapabilities::default(),
                 });
             }
             app.provider = Some(provider);
@@ -2449,7 +2476,72 @@ fn reasoning_levels(model: Option<&str>) -> Vec<(&'static str, &'static str)> {
     ]
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ModelTaskRequirements {
+    vision: bool,
+    tools: bool,
+}
+
+fn model_task_requirements(
+    prompt: &str,
+    attachments: &[PendingAttachment],
+    mode: Option<ExecutionMode>,
+) -> ModelTaskRequirements {
+    let prompt = prompt.to_ascii_lowercase();
+    let explicit_tool_mode = matches!(mode, Some(ExecutionMode::Focused | ExecutionMode::Agentic));
+    let tool_intent = [
+        "build ",
+        "create ",
+        "write ",
+        "edit ",
+        "modify ",
+        "fix ",
+        "implement ",
+        "run ",
+        "test ",
+        "folder",
+        "directory",
+        "codebase",
+        "repository",
+        "file",
+    ]
+    .iter()
+    .any(|marker| prompt.contains(marker));
+    ModelTaskRequirements {
+        vision: attachments
+            .iter()
+            .any(|attachment| attachment.kind == AttachmentKind::Image),
+        tools: explicit_tool_mode
+            || (mode != Some(ExecutionMode::Direct)
+                && (tool_intent
+                    || attachments
+                        .iter()
+                        .any(|attachment| attachment.kind != AttachmentKind::Image))),
+    }
+}
+
+fn model_matches_task(model: &ModelDescriptor, requirements: ModelTaskRequirements) -> bool {
+    model.capabilities.chat
+        && (!requirements.vision || model.capabilities.multimodal)
+        && (!requirements.tools || model.capabilities.tools)
+}
+
+fn model_capability_badges(model: &ModelDescriptor) -> String {
+    let mut badges = Vec::new();
+    if model.capabilities.multimodal {
+        badges.push("vision");
+    }
+    if model.capabilities.tools {
+        badges.push("tools");
+    }
+    if badges.is_empty() {
+        badges.push("chat");
+    }
+    badges.join(" · ")
+}
+
 fn open_picker(app: &mut App, kind: PickerKind) {
+    let model_requirements = model_task_requirements(&app.editor.text, &app.attachments, app.mode);
     let (title, options): (&'static str, Vec<PickerOption>) = match kind {
         PickerKind::Command => (
             " Command palette ",
@@ -2492,11 +2584,21 @@ fn open_picker(app: &mut App, kind: PickerKind) {
                     ),
                     auxiliary: Some(descriptor.pack.description.clone()),
                 })
-                .chain(app.models.iter().map(|model| PickerOption {
-                    value: model.id.clone(),
-                    label: format!("{}/{}", model.provider, model.id),
-                    auxiliary: Some(model.provider.clone()),
-                }))
+                .chain(
+                    app.models
+                        .iter()
+                        .filter(|model| model_matches_task(model, model_requirements))
+                        .map(|model| PickerOption {
+                            value: model.id.clone(),
+                            label: format!(
+                                "{}/{}  [{}]",
+                                model.provider,
+                                model.id,
+                                model_capability_badges(model)
+                            ),
+                            auxiliary: Some(model.provider.clone()),
+                        }),
+                )
                 .collect(),
         ),
         PickerKind::ModelPack => (
@@ -2936,6 +3038,26 @@ fn submit_prompt(
         app.editor.insert_str(&value);
         return;
     };
+    let requirements = model_task_requirements(&value, &app.attachments, app.mode);
+    if app.model_pack.is_none()
+        && let Some(selected) = app
+            .models
+            .iter()
+            .find(|candidate| candidate.provider == provider && candidate.id == model)
+        && !model_matches_task(selected, requirements)
+    {
+        let reason = if requirements.vision && !selected.capabilities.multimodal {
+            "The selected model cannot read images. Choose one of the vision-capable models shown."
+        } else if requirements.tools && !selected.capabilities.tools {
+            "The selected model cannot use the local tools required for this task. Choose one of the tool-capable models shown."
+        } else {
+            "The selected model cannot perform this task. Choose one of the compatible models shown."
+        };
+        app.editor.insert_str(&value);
+        app.activity.push_back(reason.to_string());
+        open_picker(app, PickerKind::Model);
+        return;
+    }
     app.busy = true;
     app.connected = true;
     app.last_error = None;
@@ -7115,11 +7237,12 @@ impl Drop for TerminalSession {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, AttachmentKind, ClientEvent, Overlay, PROVIDER_TEMPLATES, PickerKind, PickerOption,
-        PickerState, PromptEditor, SetupState, approval_decision_for_key, attachment_line,
-        capture_editor_drop, command_suggestions, complete_editor, composer_status_line,
-        cube_loader_line, dropped_files, editor_text, friendly_chat_error, handle_key,
-        handle_slash_command, latest_copyable_response, load_snapshot, reasoning_levels, render,
+        App, AttachmentKind, ClientEvent, ModelCapabilities, ModelDescriptor,
+        ModelTaskRequirements, Overlay, PROVIDER_TEMPLATES, PickerKind, PickerOption, PickerState,
+        PromptEditor, SetupState, approval_decision_for_key, attachment_line, capture_editor_drop,
+        command_suggestions, complete_editor, composer_status_line, cube_loader_line,
+        dropped_files, editor_text, friendly_chat_error, handle_key, handle_slash_command,
+        latest_copyable_response, load_snapshot, model_matches_task, reasoning_levels, render,
         render_content_block, render_content_block_with_details, render_overlay,
         runtime_trace_lines, submit_conversation_selection, submit_prompt,
     };
@@ -7163,6 +7286,35 @@ mod tests {
         let debug = format!("{setup:?}");
         assert!(!debug.contains(SENTINEL_SECRET));
         assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn model_picker_capabilities_exclude_text_only_models_from_image_tasks() {
+        let text_only = ModelDescriptor {
+            provider: "groq".to_string(),
+            id: "llama-3.3-70b-versatile".to_string(),
+            capabilities: ModelCapabilities {
+                chat: true,
+                tools: true,
+                multimodal: false,
+            },
+        };
+        let vision = ModelDescriptor {
+            provider: "groq".to_string(),
+            id: "qwen/qwen3.6-27b".to_string(),
+            capabilities: ModelCapabilities {
+                chat: true,
+                tools: true,
+                multimodal: true,
+            },
+        };
+        let requirements = ModelTaskRequirements {
+            vision: true,
+            tools: false,
+        };
+
+        assert!(!model_matches_task(&text_only, requirements));
+        assert!(model_matches_task(&vision, requirements));
     }
 
     #[test]
