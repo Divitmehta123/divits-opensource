@@ -1,6 +1,7 @@
 ---
 name: dependency-specialist
 description: Audits and changes dependencies, feature flags, compatibility constraints, licensing, and supply-chain risk.
+skills: ["repository-map", "independent-review", "release-gates"]
 tools:
   allow: ["fs.read", "fs.read_many", "fs.list", "fs.glob", "search.*", "shell.run", "shell.test", "git.diff", "skill.activate"]
   deny: ["fs.delete", "fs.remove_dir", "deploy.*"]

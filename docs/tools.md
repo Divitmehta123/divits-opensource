@@ -19,16 +19,17 @@ Implemented built-ins include:
   `git.worktree`, `git.stage`, `git.unstage`, `git.restore`, `git.commit`
 - `docs.write`
 
-Relative paths resolve beneath the canonical project root. Absolute paths are
-available through an on-demand approval: the agent calls the tool from the
-user's natural-language request, the TUI displays the exact path, and an
-approval resumes that call with a run-scoped grant. `/add-dir` is an optional
-persistent grant; `/dirs` and `/remove-dir` inspect or revoke saved roots.
+Relative paths resolve beneath the canonical project root. The normal local
+loopback launcher declares the host's available drives as trusted roots, so
+absolute paths can be used without an on-demand directory approval. Standalone
+non-loopback servers remain restricted and can use persistent `/add-dir`
+grants; `/dirs` and `/remove-dir` inspect or revoke saved roots.
 Canonical containment still rejects parent traversal and symlink escapes.
 Writes can require a preimage SHA-256.
 `patch.apply` parses and applies a unified diff in memory before writing.
-Processes are launched directly from a program plus argument array, never
-through an implicit shell, and require command policy approval/allowlisting.
+Processes are launched directly from a program plus argument array. They still
+pass the agent tool allowlist and command deny rules; the trusted local profile
+pre-authorizes ordinary commands, while restricted profiles require approval.
 
 SQLite tool records use a unique idempotency key. Completed calls replay the
 stored result; an in-flight call is not silently executed again. Browser,

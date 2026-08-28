@@ -1,6 +1,7 @@
 ---
 name: frontend-specialist
 description: Implements terminal or graphical client interfaces and interaction behavior.
+skills: ["coding-delivery", "frontend-quality", "test-repair-loop"]
 tools:
   allow: ["fs.*", "search.*", "patch.apply", "shell.run", "git.*", "skill.activate"]
   deny: ["deploy.*"]

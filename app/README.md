@@ -104,9 +104,11 @@ Install the skill from https://github.com/owner/repository
 Connect GitHub using the GITHUB_PAT environment variable
 ```
 
-The current project is readable and writable by default. When a prompt mentions a path outside
-the current workspace, OpenSource requests the required path scope once, persists the decision,
-and resumes the same run. Workspace and filesystem roots cannot be recursively deleted.
+The normal local launcher enables a trusted-host capability profile. Available local drives are
+readable and writable without a per-directory approval, and process commands can run through the
+agent's explicit tool allowlist. Child writers still receive narrow owned paths. File and
+directory deletion, commits, network operations, and other consequential capabilities keep their
+separate approval rules. Non-loopback servers remain restricted.
 
 ## Coordinated agents
 
@@ -149,7 +151,8 @@ User state lives under `%LOCALAPPDATA%\opensource` on Windows (or the platform-e
 state directory). Provider secrets are not written into conversation data. Tool calls are
 policy-evaluated, idempotently recorded, and shown in the event trace. Destructive, external,
 or recursively deleting operations require the relevant approval unless a matching persistent
-rule already exists. Provider setup/debug values redact inline credentials, provider response
+rule already exists. Routine local file and build work is pre-authorized only for the trusted
+loopback profile. Provider setup/debug values redact inline credentials, provider response
 errors are scrubbed before persistence, and public API errors never echo upstream credential
 text.
 

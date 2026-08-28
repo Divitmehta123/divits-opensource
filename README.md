@@ -70,7 +70,7 @@ again; environment references are persisted instead of secret values.
 - Direct, focused, automatic, and agentic modes.
 - Persistent interactive approvals with run/project/global allow and deny
   rules, plus editable tool arguments.
-- Project and explicitly granted local-directory reads, glob/search/symbol
+- Trusted local-host directory reads, glob/search/symbol
   search, image inspection, URL fetch,
   exact edits, writes, patches, copy/move/delete, shell/test processes,
   long-running process input/poll/kill, and Git inspect/stage/unstage/restore/
@@ -110,11 +110,14 @@ state. Tokens are referenced by environment-variable name and are not copied
 into MCP configuration.
 
 Ask for work anywhere on the machine in natural language, for example
-`Analyze F drive and list its folders`. The agent selects the filesystem tool
-and the TUI asks for access to the outside path at that moment. `/add-dir`
-remains an optional way to save a persistent directory grant; `/dirs` shows
-saved roots and `/remove-dir` revokes one. Individual files need no directory
-activation: drag them straight from Explorer into the prompt.
+`Analyze F drive and list its folders`. The normal `divit` launcher and its
+auto-started loopback server use a trusted-local host profile, so agents can
+inspect, create, organize, build, and test on available local drives without a
+per-directory approval. Child writers still receive explicit owned paths, and
+deletion, Git commits, network connections, and other consequential
+operations retain their own policy gates. `/add-dir`, `/dirs`, and
+`/remove-dir` remain available for restricted or remotely hosted servers.
+Individual files can also be dragged straight from Explorer into the prompt.
 They appear as compact numbered badges such as `Image 1`, `Video 1`, and
 `Video 2`, without exposing full directory paths in the composer.
 Gemini-family models receive images, audio, and video as native inline media,
@@ -134,7 +137,9 @@ available.
 ## Safety boundary
 
 Filesystem paths, commands, network requests, MCP calls, and workspace
-ownership are policy checked and approval gated. This is currently labeled
+ownership are policy checked. The trusted local loopback profile deliberately
+allows host filesystem and process work without routine prompts; destructive
+and external side effects remain gated. This is currently labeled
 `sandbox:limited`: it is not an operating-system security boundary. Do not run
 untrusted model output against sensitive projects or credentials.
 

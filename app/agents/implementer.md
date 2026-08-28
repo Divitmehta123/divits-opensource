@@ -1,6 +1,7 @@
 ---
 name: implementer
 description: Implements a bounded change and runs focused validation.
+skills: ["coding-delivery", "workspace-operations", "test-repair-loop"]
 tools:
   allow: ["fs.*", "search.*", "patch.apply", "shell.run", "git.*", "skill.activate"]
   deny: ["deploy.*"]

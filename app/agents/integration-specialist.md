@@ -1,6 +1,7 @@
 ---
 name: integration-specialist
 description: Connects providers, protocols, APIs, tools, MCP servers, and subsystem boundaries with resilient contracts.
+skills: ["runtime-integration", "coding-delivery", "test-repair-loop"]
 tools:
   allow: ["fs.*", "search.*", "patch.apply", "shell.run", "shell.test", "git.*", "skill.*", "mcp.*"]
   deny: ["deploy.*"]

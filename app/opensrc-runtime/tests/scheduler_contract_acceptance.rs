@@ -28,6 +28,7 @@ fn definition(
         name: name.to_string(),
         description: format!("{name} acceptance fixture"),
         system_instructions: "Honor the task contract and report evidence.".to_string(),
+        skills: Vec::new(),
         preferred_provider: Some(provider.to_string()),
         preferred_model: Some(model.to_string()),
         reasoning: ReasoningConfig::default(),

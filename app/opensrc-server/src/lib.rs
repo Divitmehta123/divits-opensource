@@ -1327,16 +1327,30 @@ async fn chat(
             .sandbox_policy
             .write_paths
             .extend(attachment_paths);
-        definition.system_instructions.push_str(
-            "\n\nFilesystem access: Tools accept absolute local paths, including paths on \
-             other drives. When the user naturally asks to inspect, manage, edit, or analyze \
-             a directory outside the current project, call the appropriate filesystem tool \
-             with that absolute path immediately. Do not ask for a special command or ask in \
-             prose first: the tool call itself opens the access approval prompt, and execution \
-             resumes automatically if the user allows it. Attached files and the accompanying \
-             user text are one request: inspect the attachments and carry out the stated task. \
-             Do not ask what to do with an attachment when the user's text already says what to do.",
-        );
+        state
+            .runtime
+            .local_access
+            .apply_to_definition(&mut definition);
+        if definition.sandbox_policy.trusted_local {
+            definition.system_instructions.push_str(
+                "\n\nTrusted local host access is active. Filesystem and process tools may use \
+                 absolute paths on the host's local drives without asking the user for an access \
+                 confirmation. Inspect, create, edit, organize, build, and test directly when the \
+                 request requires it. Child agents must receive explicit owned paths and inherit \
+                 this host capability. Approval remains required for destructive or externally \
+                 consequential operations. Attached files and the accompanying user text are one \
+                 request: inspect the attachments and carry out the stated task.",
+            );
+        } else {
+            definition.system_instructions.push_str(
+                "\n\nFilesystem access: Tools accept absolute local paths, including paths on \
+                 other drives. When the user asks to inspect, manage, edit, or analyze a directory \
+                 outside the current project, call the appropriate filesystem tool directly; the \
+                 policy engine will request approval when required. Attached files and the \
+                 accompanying user text are one request: inspect the attachments and carry out the \
+                 stated task.",
+            );
+        }
         if !request.allowed_tools.is_empty() {
             let visible = state
                 .runtime
@@ -3160,7 +3174,7 @@ mod tests {
             "Analyze this calculator screenshot and describe the UI.",
         );
         let mode = opensrc_runtime::ModeClassifier::classify(&request).mode;
-        assert_eq!(mode, opensrc_core::ExecutionMode::Focused);
+        assert_eq!(mode, opensrc_core::ExecutionMode::Agentic);
         assert!(opensrc_runtime::request_requires_mutation(&request));
         assert_eq!(automatic_agent_name(&request, mode), "frontend-specialist");
     }

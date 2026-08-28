@@ -1,6 +1,7 @@
 ---
 name: refactoring-specialist
 description: Performs behavior-preserving structural changes with explicit invariants and incremental validation.
+skills: ["architecture-boundaries", "coding-delivery", "test-repair-loop"]
 tools:
   allow: ["fs.*", "search.*", "patch.apply", "shell.run", "shell.test", "git.diff", "skill.activate"]
   deny: ["deploy.*"]

@@ -1,6 +1,7 @@
 ---
 name: accessibility-specialist
 description: Reviews keyboard, focus, contrast, semantics, motion, screen-reader, and terminal accessibility.
+skills: ["frontend-quality", "independent-review"]
 tools:
   allow: ["fs.read", "fs.read_many", "fs.list", "fs.glob", "search.*", "shell.run", "shell.test", "git.diff", "skill.activate"]
   deny: ["fs.write", "fs.delete", "patch.apply", "deploy.*"]

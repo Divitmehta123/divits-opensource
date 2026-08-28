@@ -5,8 +5,8 @@ use crate::{
     ResolvedModelAssignment, RoleExecutionKind, RouterError, RoutingPolicyError,
     RoutingPolicyRegistry, SkillRegistry, ToolDescriptor, ToolExecutionError, ToolExecutionResult,
     ToolExecutor, apply_role_policy, built_in_agent_definitions, combine_request_context,
-    is_continuation_request, request_requires_mutation, resolve_agent_definition,
-    selected_file_paths,
+    inherit_trusted_local_access, is_continuation_request, request_requires_mutation,
+    resolve_agent_definition, selected_file_paths,
 };
 use chrono::Utc;
 use futures::StreamExt;
@@ -2020,6 +2020,7 @@ impl ExecutionEngine {
                         definition.preferred_model = Some(model.to_string());
                     }
                 }
+                inherit_trusted_local_access(agent, &mut definition);
                 if definition.workspace_mode == WorkspaceMode::GitWorktree {
                     definition.workspace_mode = WorkspaceMode::OwnedPaths;
                     self.store
@@ -2682,7 +2683,7 @@ impl ExecutionEngine {
         )?;
         let plan_request = CanonicalModelRequest {
             model: planner_model.to_string(),
-            system: agentic_planner_prompt(),
+            system: agentic_planner_prompt(&root),
             messages: planner_history
                 .into_iter()
                 .map(message_to_canonical)
@@ -2846,6 +2847,7 @@ impl ExecutionEngine {
             } else {
                 definition.fallback_chain.clear();
             }
+            inherit_trusted_local_access(&root, &mut definition);
             if definition.workspace_mode == WorkspaceMode::GitWorktree {
                 definition.workspace_mode = WorkspaceMode::OwnedPaths;
                 self.store.append_event(
@@ -3402,6 +3404,7 @@ impl ExecutionEngine {
                 .map(|pack| pack.fallback_chain(member))
                 .unwrap_or_default();
         }
+        inherit_trusted_local_access(root, &mut repair_definition);
         let repair_agent = control.spawn_agent_with_ownership(
             root.id,
             &repair_definition,
@@ -3506,6 +3509,7 @@ impl ExecutionEngine {
                 .map(|pack| pack.fallback_chain(member))
                 .unwrap_or_default();
         }
+        inherit_trusted_local_access(root, &mut reviewer_definition);
         let reviewer_agent = control.spawn_agent_with_ownership(
             root.id,
             &reviewer_definition,
@@ -5207,13 +5211,22 @@ fn validate_planned_task(id: &str, task: &PlannedTask) -> Result<(), ExecutionEr
     Ok(())
 }
 
-fn agentic_planner_prompt() -> String {
+fn agentic_planner_prompt(root: &Agent) -> String {
     let roles = built_in_agent_definitions()
         .unwrap_or_default()
         .into_iter()
         .map(|definition| format!("{}: {}", definition.name, definition.description))
         .collect::<Vec<_>>()
         .join("\n");
+    let local_access = if root.sandbox_policy.trusted_local {
+        format!(
+            "\n- Trusted local host access is active. Tasks may use absolute owned_paths beneath \
+             these configured roots when the objective targets files outside the project: {}.",
+            root.sandbox_policy.write_paths.join(", ")
+        )
+    } else {
+        String::new()
+    };
     format!(
         "You are the root planner for a real local coding-agent runtime. Build a dependency-aware \
          plan that will be executed, not a prose suggestion. Return only schema-valid JSON.\n\n\
@@ -5226,7 +5239,7 @@ fn agentic_planner_prompt() -> String {
            genuinely spans the project; read-only tasks use an empty list.\n\
          - For implementation work, include validation and independent review when useful.\n\
          - Select the specialist by work type, never by model name. The runtime assigns models.\n\
-         - Do not invent files, tools, providers, results, or completed work.\n\n\
+         - Do not invent files, tools, providers, results, or completed work.{local_access}\n\n\
          Available specialist roles:\n{roles}"
     )
 }
@@ -5454,6 +5467,7 @@ fn task_contract_message(
         "task_id": task.id,
         "agent_id": agent.id,
         "role": agent.role,
+        "dedicated_skills": agent.skills,
         "provider": agent.provider,
         "model": agent.model,
         "objective": task.contract.objective,
@@ -6302,6 +6316,18 @@ fn quote_command_argument(value: &str) -> String {
 }
 
 fn focused_system_prompt(agent: &Agent, skills: &SkillRegistry, mcp: &McpRegistry) -> String {
+    let dedicated_skills = agent
+        .skills
+        .iter()
+        .map(|name| match skills.activate(name) {
+            Ok(skill) => format!(
+                "### {}\nSource: {}\n{}",
+                skill.metadata.name, skill.source_path, skill.instructions
+            ),
+            Err(error) => format!("### {name}\nUnavailable: {error}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
     let skill_catalog = skills
         .metadata()
         .into_iter()
@@ -6317,7 +6343,8 @@ fn focused_system_prompt(agent: &Agent, skills: &SkillRegistry, mcp: &McpRegistr
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "{}\n\nYou are in focused coding mode. Batch independent reads and searches. \
+        "{}\n\nDedicated role skills are already active for this run. Follow them as \
+         mandatory execution guidance:\n\n{}\n\nYou are in focused coding mode. Batch independent reads and searches. \
          Use only the exposed tools. Prefer patch.apply with an expected SHA-256 for edits. \
          When the user asks about local files, folders, directories, disks, or drives, inspect \
          them with the filesystem tools. Never claim that local access is unavailable and never \
@@ -6342,6 +6369,11 @@ fn focused_system_prompt(agent: &Agent, skills: &SkillRegistry, mcp: &McpRegistr
          Enabled MCP servers: {}. Use mcp.list_tools before invoking an unfamiliar MCP tool. \
          When validation is complete, return the concise final answer without another tool call.",
         agent.system_instructions,
+        if dedicated_skills.is_empty() {
+            "none".to_string()
+        } else {
+            dedicated_skills
+        },
         if skill_catalog.is_empty() {
             "none".to_string()
         } else {
@@ -6762,14 +6794,14 @@ mod tests {
         ExecutionEngine, SkillInstallToolArgs, compacted_history, contextual_visible_tools,
         deterministic_directory_inventory_target, directory_inventory_answer,
         effective_execution_objective, explicit_artifact_paths, extract_materializable_artifacts,
-        install_skill, missing_explicit_artifact_paths, native_media_tool_reference,
-        non_retryable_tool_error, normalize_github_skill_url, normalize_provider_write_call,
-        parse_agentic_plan, provider_retry_wait_ms, reconcile_materializable_artifacts,
-        relevant_image_references, request_requires_mutation,
+        focused_system_prompt, install_skill, missing_explicit_artifact_paths,
+        native_media_tool_reference, non_retryable_tool_error, normalize_github_skill_url,
+        normalize_provider_write_call, parse_agentic_plan, provider_retry_wait_ms,
+        reconcile_materializable_artifacts, relevant_image_references, request_requires_mutation,
     };
     use crate::{
-        AgentControl, AgentLimits, ChangeManager, ExecutionError, ModelPackRegistry,
-        ProviderRouter, ToolExecutor, ToolRegistry,
+        AgentControl, AgentLimits, ChangeManager, ExecutionError, McpRegistry, ModelPackRegistry,
+        ProviderRouter, SkillRegistry, ToolExecutor, ToolRegistry,
     };
     use async_trait::async_trait;
     use opensrc_core::{
@@ -6811,6 +6843,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn focused_prompt_automatically_loads_the_agents_dedicated_skills() {
+        let store = Store::in_memory().expect("store");
+        let conversation = store.create_conversation(".", None).expect("conversation");
+        let run = store
+            .create_run(conversation.id, "implement", ExecutionMode::Focused)
+            .expect("run");
+        let definition = crate::built_in_agent_definition("implementer").expect("implementer");
+        let agent = AgentControl::new(store, AgentLimits::default())
+            .create_root(run.id, &definition, "implement", ".")
+            .expect("root agent");
+
+        let prompt = focused_system_prompt(
+            &agent,
+            &SkillRegistry::builtins().expect("skills"),
+            &McpRegistry::default(),
+        );
+
+        assert!(prompt.contains("Dedicated role skills are already active"));
+        assert!(prompt.contains("### coding-delivery"));
+        assert!(prompt.contains("### workspace-operations"));
+        assert!(prompt.contains("### test-repair-loop"));
+        assert!(!prompt.contains("Unavailable:"));
+    }
+
     #[tokio::test]
     async fn installs_a_local_skill_into_the_live_project_registry() {
         let workspace =
@@ -6836,6 +6893,7 @@ mod tests {
             model: "fixture".to_string(),
             reasoning: ReasoningConfig::default(),
             system_instructions: String::new(),
+            skills: Vec::new(),
             context_policy: ContextPolicy::default(),
             tool_policy: ToolPolicy::default(),
             workspace: Workspace {
@@ -6958,6 +7016,7 @@ mod tests {
             model: "fixture".to_string(),
             reasoning: ReasoningConfig::default(),
             system_instructions: String::new(),
+            skills: Vec::new(),
             context_policy: ContextPolicy::default(),
             tool_policy: ToolPolicy::default(),
             workspace: Workspace {
@@ -8281,6 +8340,7 @@ document.title = "Calculator";
             name: "focused".to_string(),
             description: "test".to_string(),
             system_instructions: "Work carefully.".to_string(),
+            skills: Vec::new(),
             preferred_provider: None,
             preferred_model: None,
             reasoning: ReasoningConfig::default(),
@@ -8440,6 +8500,7 @@ document.title = "Calculator";
             name: "frontend-specialist".to_string(),
             description: "test".to_string(),
             system_instructions: "Complete the requested build.".to_string(),
+            skills: Vec::new(),
             preferred_provider: None,
             preferred_model: None,
             reasoning: ReasoningConfig::default(),
@@ -8558,6 +8619,7 @@ document.title = "Calculator";
             name: "media-specialist".to_string(),
             description: "test".to_string(),
             system_instructions: "Inspect the image.".to_string(),
+            skills: Vec::new(),
             preferred_provider: None,
             preferred_model: None,
             reasoning: ReasoningConfig::default(),
@@ -8627,6 +8689,7 @@ document.title = "Calculator";
             name: "frontend-specialist".to_string(),
             description: "test".to_string(),
             system_instructions: "Build the requested files.".to_string(),
+            skills: Vec::new(),
             preferred_provider: None,
             preferred_model: None,
             reasoning: ReasoningConfig::default(),
@@ -8754,6 +8817,7 @@ document.title = "Calculator";
             name: "frontend-specialist".to_string(),
             description: "test".to_string(),
             system_instructions: "Use canonical filesystem tools.".to_string(),
+            skills: Vec::new(),
             preferred_provider: None,
             preferred_model: None,
             reasoning: ReasoningConfig::default(),
@@ -8861,6 +8925,7 @@ document.title = "Calculator";
             name: "focused".to_string(),
             description: "test".to_string(),
             system_instructions: "Work carefully.".to_string(),
+            skills: Vec::new(),
             preferred_provider: None,
             preferred_model: None,
             reasoning: ReasoningConfig::default(),
@@ -8927,6 +8992,7 @@ document.title = "Calculator";
             name: "implementer".to_string(),
             description: "test".to_string(),
             system_instructions: "Edit carefully.".to_string(),
+            skills: Vec::new(),
             preferred_provider: None,
             preferred_model: None,
             reasoning: ReasoningConfig::default(),

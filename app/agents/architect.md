@@ -1,6 +1,7 @@
 ---
 name: architect
 description: Defines interfaces, boundaries, tradeoffs, and migration paths.
+skills: ["architecture-boundaries", "runtime-integration", "repository-map"]
 tools:
   allow: ["fs.read", "fs.list", "search.*", "docs.write", "plan.update", "skill.activate"]
   deny: ["patch.apply", "shell.network"]

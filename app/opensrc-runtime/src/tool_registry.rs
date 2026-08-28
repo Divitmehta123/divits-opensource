@@ -3143,8 +3143,8 @@ mod tests {
     use base64::Engine;
     use chrono::Utc;
     use opensrc_core::{
-        Agent, AgentStatus, Budgets, ContextPolicy, ReasoningConfig, RetryPolicy, SandboxPolicy,
-        ToolPolicy, Workspace, WorkspaceMode,
+        Agent, AgentStatus, Budgets, ContextPolicy, PolicyDecision, ReasoningConfig, RetryPolicy,
+        SandboxPolicy, ToolPolicy, Workspace, WorkspaceMode,
     };
     use serde_json::json;
     use uuid::Uuid;
@@ -3163,6 +3163,7 @@ mod tests {
             model: "mock".to_string(),
             reasoning: ReasoningConfig::default(),
             system_instructions: String::new(),
+            skills: Vec::new(),
             context_policy: ContextPolicy::default(),
             tool_policy: policy,
             workspace: Workspace {
@@ -3211,6 +3212,92 @@ mod tests {
         };
         assert_eq!(registry.visible_for(&policy).len(), 1);
         assert_eq!(registry.visible_for(&policy)[0].name, "fs.read");
+    }
+
+    #[tokio::test]
+    async fn trusted_local_profile_runs_external_writes_processes_and_spawns_without_prompts() {
+        let base = std::env::temp_dir().join(format!("opensrc-trusted-{}", Uuid::new_v4()));
+        let project = base.join("project");
+        let external = base.join("external");
+        std::fs::create_dir_all(&project).expect("project");
+        std::fs::create_dir_all(&external).expect("external");
+        let project = project.to_string_lossy().into_owned();
+        let root = external.to_string_lossy().into_owned();
+        let policy = ToolPolicy {
+            allow: vec![
+                "fs.*".to_string(),
+                "shell.*".to_string(),
+                "agents.*".to_string(),
+            ],
+            deny: Vec::new(),
+            may_spawn_children: true,
+        };
+        let mut agent = test_agent(&project, policy);
+        agent.workspace.owned_paths.push(root.clone());
+        agent.sandbox_policy = SandboxPolicy {
+            trusted_local: true,
+            read_paths: vec![root.clone()],
+            write_paths: vec![root.clone()],
+            command_allow: vec!["*".to_string()],
+            process_allow: vec!["*".to_string()],
+            ..SandboxPolicy::default()
+        };
+        let executor = ToolExecutor::default();
+
+        let write = executor
+            .evaluate(
+                &agent,
+                "fs.write",
+                &json!({"path": format!("{root}/file.txt"), "content": "ready"}),
+            )
+            .expect("write policy");
+        let process = executor
+            .evaluate(
+                &agent,
+                "shell.test",
+                &json!({"program": "cargo", "args": ["test"], "cwd": root}),
+            )
+            .expect("process policy");
+        let spawn = executor
+            .evaluate(
+                &agent,
+                "agents.spawn",
+                &json!({"task": "inspect", "role": "investigator"}),
+            )
+            .expect("spawn policy");
+        let destructive = executor
+            .evaluate(
+                &agent,
+                "fs.remove_dir",
+                &json!({"path": root, "recursive": true}),
+            )
+            .expect("destructive policy");
+        let file_delete = executor
+            .evaluate(
+                &agent,
+                "fs.delete",
+                &json!({"path": format!("{root}/file.txt")}),
+            )
+            .expect("file delete policy");
+
+        assert_eq!(write.decision, PolicyDecision::Allow);
+        assert_eq!(process.decision, PolicyDecision::Allow);
+        assert_eq!(spawn.decision, PolicyDecision::Allow);
+        assert_eq!(destructive.decision, PolicyDecision::Ask);
+        assert_eq!(file_delete.decision, PolicyDecision::Ask);
+        executor
+            .execute(
+                &agent,
+                "fs.write",
+                json!({"path": format!("{root}/file.txt"), "content": "ready"}),
+            )
+            .await
+            .expect("trusted external write");
+        assert_eq!(
+            std::fs::read_to_string(external.join("file.txt")).expect("written file"),
+            "ready"
+        );
+        std::fs::remove_dir_all(base).expect("cleanup");
     }
 
     #[test]

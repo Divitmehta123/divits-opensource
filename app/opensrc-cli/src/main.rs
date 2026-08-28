@@ -5,8 +5,8 @@ use clap::{CommandFactory, Parser, Subcommand};
 use opensrc_core::{Agent, AgentDefinition, Conversation, ExecutionMode, RunExecutionResult};
 use opensrc_providers::{build_adapters, read_provider_file};
 use opensrc_runtime::{
-    AgentLimits, McpRegistry, McpServer, McpTransport, ModeClassifier, ModelPackRegistry,
-    ProviderRouter, RoutingPolicyRegistry, Runtime, SkillRegistry, ToolExecutor,
+    AgentLimits, LocalAccessProfile, McpRegistry, McpServer, McpTransport, ModeClassifier,
+    ModelPackRegistry, ProviderRouter, RoutingPolicyRegistry, Runtime, SkillRegistry, ToolExecutor,
     load_agent_definition,
 };
 use opensrc_server::ServerState;
@@ -188,6 +188,12 @@ enum AgentCommand {
             default_value = "fs.*,search.*,patch.apply,shell.run"
         )]
         tools: Vec<String>,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            default_value = "coding-delivery,workspace-operations,test-repair-loop"
+        )]
+        skills: Vec<String>,
         #[arg(long)]
         force: bool,
         #[arg(long, default_value = ".")]
@@ -400,6 +406,7 @@ async fn main() -> Result<()> {
                 description,
                 workspace_mode,
                 tools,
+                skills,
                 force,
                 project,
             } => create_agent_definition(
@@ -408,6 +415,7 @@ async fn main() -> Result<()> {
                 &description,
                 &workspace_mode,
                 &tools,
+                &skills,
                 force,
             ),
             AgentCommand::List { server } => list_agent_definitions_command(&server).await,
@@ -458,6 +466,7 @@ async fn launch() -> Result<()> {
         &state_dir.join("state.sqlite3"),
         Some(&provider_config),
         &skills_dir,
+        true,
     )?;
     let server_task = tokio::spawn(opensrc_server::serve(state, bind));
 
@@ -556,7 +565,12 @@ async fn serve(
     provider_config: Option<&Path>,
     skills_dir: &Path,
 ) -> Result<()> {
-    let state = build_server_state(database, provider_config, skills_dir)?;
+    let state = build_server_state(
+        database,
+        provider_config,
+        skills_dir,
+        bind.ip().is_loopback(),
+    )?;
     opensrc_server::serve(state, bind).await?;
     Ok(())
 }
@@ -566,6 +580,7 @@ fn build_server_state(
     database: &Path,
     provider_config: Option<&Path>,
     skills_dir: &Path,
+    trusted_local: bool,
 ) -> Result<ServerState> {
     let store = Store::open(database)
         .with_context(|| format!("failed to open database {}", database.display()))?;
@@ -649,6 +664,11 @@ fn build_server_state(
             )
         })?;
     let routing_limits = routing_policies.limits();
+    let local_access = if trusted_local {
+        LocalAccessProfile::trusted_host()
+    } else {
+        LocalAccessProfile::restricted()
+    };
     Ok(ServerState {
         runtime: Runtime::with_components(
             store,
@@ -684,7 +704,8 @@ fn build_server_state(
                 )
             },
         )?)
-        .with_routing_policy_registry(routing_policies),
+        .with_routing_policy_registry(routing_policies)
+        .with_local_access_profile(local_access),
         provider_config_path: Some(provider_config_path),
     })
 }
@@ -787,6 +808,7 @@ async fn ensure_local_server(
         &state_dir.join("state.sqlite3"),
         Some(&provider_config),
         &skills_dir,
+        true,
     )?;
     let task = tokio::spawn(opensrc_server::serve(state, bind));
     for _ in 0..40 {
@@ -1421,6 +1443,7 @@ fn create_agent_definition(
     description: &str,
     workspace_mode: &str,
     tools: &[String],
+    skills: &[String],
     force: bool,
 ) -> Result<()> {
     if name.is_empty()
@@ -1461,8 +1484,13 @@ fn create_agent_definition(
         .map(serde_json::to_string)
         .collect::<std::result::Result<Vec<_>, _>>()?
         .join(", ");
+    let quoted_skills = skills
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .join(", ");
     let document = format!(
-        "---\nname: {name}\ndescription: {quoted_description}\ntools:\n  allow: [{quoted_tools}]\n  deny: []\n  may_spawn_children: false\nworkspace_mode: {workspace_mode}\ncompletion_schema: task_completion\n---\nDescribe the role's concrete responsibilities, constraints, and completion criteria here.\n"
+        "---\nname: {name}\ndescription: {quoted_description}\nskills: [{quoted_skills}]\ntools:\n  allow: [{quoted_tools}]\n  deny: []\n  may_spawn_children: false\nworkspace_mode: {workspace_mode}\ncompletion_schema: task_completion\n---\nDescribe the role's concrete responsibilities, constraints, and completion criteria here.\n"
     );
     std::fs::write(&path, document)
         .with_context(|| format!("failed to write {}", path.display()))?;
@@ -1535,7 +1563,7 @@ fn percentile(sorted: &[u64], percentile: usize) -> u64 {
 
 #[cfg(test)]
 mod cli_tests {
-    use super::{AuthCommand, Cli, Command, SessionCommand};
+    use super::{AuthCommand, Cli, Command, SessionCommand, build_server_state};
     use clap::Parser;
 
     #[test]
@@ -1571,5 +1599,23 @@ mod cli_tests {
                 command: SessionCommand::Compact { id: parsed, .. }
             }) if parsed == id
         ));
+    }
+
+    #[test]
+    fn integrated_server_enables_only_the_explicit_trusted_local_profile() {
+        let root = std::env::temp_dir().join(format!("divit-cli-state-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("state root");
+        let skills = root.join("skills");
+
+        let trusted = build_server_state(&root.join("trusted.db"), None, &skills, true)
+            .expect("trusted state");
+        let restricted = build_server_state(&root.join("restricted.db"), None, &skills, false)
+            .expect("restricted state");
+
+        assert!(trusted.runtime.local_access.is_trusted());
+        assert!(!restricted.runtime.local_access.is_trusted());
+        drop(trusted);
+        drop(restricted);
+        std::fs::remove_dir_all(root).expect("cleanup");
     }
 }

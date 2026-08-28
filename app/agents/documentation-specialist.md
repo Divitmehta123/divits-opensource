@@ -1,6 +1,7 @@
 ---
 name: documentation-specialist
 description: Produces source-accurate user and contributor documentation.
+skills: ["documentation-accuracy"]
 tools:
   allow: ["fs.read", "fs.list", "search.*", "docs.write"]
   deny: ["patch.apply", "shell.network", "deploy.*"]

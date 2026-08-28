@@ -14,9 +14,12 @@ policy. Workspace modes are:
 The current code enforces tool allow/deny rules, read/write workspace
 containment, owned-path checks, command allow/deny rules, network/process
 approval decisions, direct argument-array process launch, and execution
-timeouts. It never accepts an implicit shell command string.
+timeouts. A host-scoped trusted-local profile is enabled only by loopback
+launchers: it declares local drive roots and ordinary processes pre-authorized
+without changing provider or model behavior. Agent tool allowlists, child
+owned-path boundaries, command denials, and destructive-operation approvals
+remain enforced.
 
 Platform enforcers for Windows, macOS, Linux, and containers are not implemented
-yet. Approval persistence/resumption is also incomplete. Until those are
-implemented, the application must not be described as safely sandboxing
-untrusted commands.
+yet. Until they are implemented, the application must not be described as
+safely sandboxing untrusted commands.

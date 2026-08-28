@@ -243,6 +243,7 @@ mod tests {
             name: "editor".to_string(),
             description: "Edits files".to_string(),
             system_instructions: "Edit carefully.".to_string(),
+            skills: Vec::new(),
             preferred_provider: None,
             preferred_model: None,
             reasoning: ReasoningConfig::default(),

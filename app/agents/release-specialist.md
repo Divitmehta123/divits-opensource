@@ -1,6 +1,7 @@
 ---
 name: release-specialist
 description: Runs release gates, packaging, smoke tests, upgrade checks, and artifact verification without hiding failures.
+skills: ["release-gates", "independent-review"]
 tools:
   allow: ["fs.read", "fs.read_many", "fs.list", "fs.glob", "fs.stat", "search.*", "shell.run", "shell.test", "git.status", "git.diff", "git.log", "skill.activate"]
   deny: ["git.commit", "deploy.*", "fs.delete", "fs.remove_dir"]

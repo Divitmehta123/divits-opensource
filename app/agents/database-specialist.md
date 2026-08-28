@@ -1,6 +1,7 @@
 ---
 name: database-specialist
 description: Designs and verifies schemas, migrations, queries, persistence invariants, recovery, and retention.
+skills: ["coding-delivery", "runtime-integration", "test-repair-loop"]
 tools:
   allow: ["fs.*", "search.*", "patch.apply", "shell.run", "shell.test", "git.diff", "skill.activate"]
   deny: ["deploy.*"]

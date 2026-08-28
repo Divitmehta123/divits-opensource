@@ -30,6 +30,8 @@ struct FrontMatter {
     name: String,
     description: String,
     #[serde(default)]
+    skills: Vec<String>,
+    #[serde(default)]
     provider: Option<String>,
     #[serde(default)]
     model: Option<String>,
@@ -320,6 +322,7 @@ fn parse_agent_definition(content: &str, path: &Path) -> Result<AgentDefinition,
             body.unwrap_or_default().trim(),
             FIXED_AGENT_CONTRACT.trim()
         ),
+        skills: front.skills,
         preferred_provider: front.provider,
         preferred_model: front.model,
         reasoning: front.reasoning,
@@ -333,4 +336,43 @@ fn parse_agent_definition(content: &str, path: &Path) -> Result<AgentDefinition,
         completion_schema: front.completion_schema,
         metadata: front.metadata,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::built_in_agent_definitions;
+    use crate::SkillRegistry;
+
+    #[test]
+    fn every_builtin_agent_has_tools_instructions_and_resolvable_dedicated_skills() {
+        let registry = SkillRegistry::builtins().expect("built-in skills");
+        let definitions = built_in_agent_definitions().expect("built-in agents");
+
+        assert_eq!(definitions.len(), 21);
+        for definition in definitions {
+            assert!(
+                !definition.system_instructions.trim().is_empty(),
+                "{} has no instructions",
+                definition.name
+            );
+            assert!(
+                !definition.tool_policy.allow.is_empty(),
+                "{} has no tool allowlist",
+                definition.name
+            );
+            assert!(
+                !definition.skills.is_empty(),
+                "{} has no dedicated skills",
+                definition.name
+            );
+            for skill in &definition.skills {
+                registry.activate(skill).unwrap_or_else(|error| {
+                    panic!(
+                        "{} references unavailable skill {skill}: {error}",
+                        definition.name
+                    )
+                });
+            }
+        }
+    }
 }

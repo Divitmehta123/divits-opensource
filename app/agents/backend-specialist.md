@@ -1,6 +1,7 @@
 ---
 name: backend-specialist
 description: Implements runtime, protocol, persistence, and provider services.
+skills: ["coding-delivery", "runtime-integration", "test-repair-loop"]
 tools:
   allow: ["fs.*", "search.*", "patch.apply", "shell.run", "git.*", "skill.activate"]
   deny: ["deploy.*"]

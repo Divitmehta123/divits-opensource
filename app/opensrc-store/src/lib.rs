@@ -3114,6 +3114,7 @@ mod tests {
             model: "mock".to_string(),
             reasoning: ReasoningConfig::default(),
             system_instructions: String::new(),
+            skills: Vec::new(),
             context_policy: ContextPolicy::default(),
             tool_policy: ToolPolicy::default(),
             workspace: Workspace {

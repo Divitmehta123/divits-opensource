@@ -309,6 +309,8 @@ pub struct WorkspaceLease {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SandboxPolicy {
+    #[serde(default)]
+    pub trusted_local: bool,
     pub read_paths: Vec<String>,
     pub write_paths: Vec<String>,
     pub network_allow: Vec<String>,
@@ -521,6 +523,8 @@ pub struct Agent {
     pub model: String,
     pub reasoning: ReasoningConfig,
     pub system_instructions: String,
+    #[serde(default)]
+    pub skills: Vec<String>,
     pub context_policy: ContextPolicy,
     pub tool_policy: ToolPolicy,
     pub workspace: Workspace,
@@ -996,6 +1000,8 @@ pub struct AgentDefinition {
     pub name: String,
     pub description: String,
     pub system_instructions: String,
+    #[serde(default)]
+    pub skills: Vec<String>,
     pub preferred_provider: Option<String>,
     pub preferred_model: Option<String>,
     pub reasoning: ReasoningConfig,

@@ -1,6 +1,7 @@
 ---
 name: generalist
 description: Coordinates broad implementation work and may delegate bounded subtasks.
+skills: ["agent-coordination", "coding-delivery", "workspace-operations", "test-repair-loop"]
 tools:
   allow: ["fs.*", "search.*", "shell.run", "patch.apply", "git.*", "agents.*", "plan.update", "skill.*", "mcp.*"]
   deny: []

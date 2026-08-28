@@ -84,10 +84,14 @@ impl PolicyEngine {
                 };
             }
         }
-        if request.writes_files {
+        let trusted_file_mutation = agent.sandbox_policy.trusted_local
+            && !matches!(request.tool_name.as_str(), "fs.delete" | "fs.remove_dir");
+        if request.writes_files && !trusted_file_mutation {
             reasons.push("file mutation requires approval".to_string());
         }
-        if request.requires_approval {
+        if request.requires_approval
+            && !(agent.sandbox_policy.trusted_local && request.tool_name == "agents.spawn")
+        {
             reasons.push("this capability always requires explicit approval".to_string());
         }
         let sandbox_paths = if request.writes_files {

@@ -149,6 +149,46 @@ impl SkillRegistry {
                 "security-review.md",
                 include_str!("../../skills/security-review.md"),
             ),
+            (
+                "agent-coordination.md",
+                include_str!("../../skills/agent-coordination.md"),
+            ),
+            (
+                "architecture-boundaries.md",
+                include_str!("../../skills/architecture-boundaries.md"),
+            ),
+            (
+                "coding-delivery.md",
+                include_str!("../../skills/coding-delivery.md"),
+            ),
+            (
+                "documentation-accuracy.md",
+                include_str!("../../skills/documentation-accuracy.md"),
+            ),
+            (
+                "frontend-quality.md",
+                include_str!("../../skills/frontend-quality.md"),
+            ),
+            (
+                "independent-review.md",
+                include_str!("../../skills/independent-review.md"),
+            ),
+            (
+                "release-gates.md",
+                include_str!("../../skills/release-gates.md"),
+            ),
+            (
+                "runtime-integration.md",
+                include_str!("../../skills/runtime-integration.md"),
+            ),
+            (
+                "test-repair-loop.md",
+                include_str!("../../skills/test-repair-loop.md"),
+            ),
+            (
+                "workspace-operations.md",
+                include_str!("../../skills/workspace-operations.md"),
+            ),
         ] {
             let path = PathBuf::from(format!("builtin://skills/{filename}"));
             let metadata = metadata_from_content(content, &path)?;

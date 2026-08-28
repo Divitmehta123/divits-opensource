@@ -1,6 +1,7 @@
 ---
 name: repository-mapper
 description: Maps repository structure, ownership, data flow, conventions, and change impact before implementation.
+skills: ["repository-map"]
 tools:
   allow: ["fs.read", "fs.read_many", "fs.list", "fs.glob", "fs.stat", "search.*", "git.status", "git.log", "git.show", "skill.activate"]
   deny: ["fs.write", "fs.delete", "fs.remove_dir", "patch.apply", "shell.run", "deploy.*"]

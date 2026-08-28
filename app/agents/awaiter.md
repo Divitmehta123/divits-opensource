@@ -1,6 +1,7 @@
 ---
 name: awaiter
 description: Monitors long-running state without performing unrelated work.
+skills: ["agent-coordination"]
 tools:
   allow: ["process.poll", "agents.status", "agents.wait"]
   deny: ["fs.write", "patch.apply", "shell.run", "shell.network"]

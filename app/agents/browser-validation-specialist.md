@@ -1,6 +1,7 @@
 ---
 name: browser-validation-specialist
 description: Validates browser-visible behavior through a restricted browser capability.
+skills: ["frontend-quality", "independent-review"]
 tools:
   allow: ["search.fetch", "fs.read", "fs.list", "fs.view_image"]
   deny: ["fs.write", "patch.apply", "shell.*"]

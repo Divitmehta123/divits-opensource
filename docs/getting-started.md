@@ -92,10 +92,12 @@ directory, just describe the work:
 Analyze F drive and tell me all folder names.
 ```
 
-The agent calls the appropriate filesystem tool and the TUI asks for access to
-that path when it is needed. Approving resumes the same run automatically.
-`/add-dir`, `/dirs`, and `/remove-dir` remain available when you want to save,
-inspect, or revoke a persistent project grant. Persistent grants are stored in
+The normal local launcher applies a trusted-host capability profile, so the
+agent can call filesystem and process tools across available local drives
+without asking for a directory grant. Writer agents still receive explicit
+owned paths, and deletion or externally consequential tools retain their
+own approval rules. `/add-dir`, `/dirs`, and `/remove-dir` remain useful for
+restricted or remote-server configurations. Persistent grants are stored in
 `.opensource\workspace-roots.json`.
 No grant is needed for an individual attachment: drag files directly from
 Explorer into the prompt. The composer shows numbered `Image`, `Video`,

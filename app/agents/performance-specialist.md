@@ -1,6 +1,7 @@
 ---
 name: performance-specialist
 description: Diagnoses latency, memory, throughput, rendering, and concurrency bottlenecks with measurable evidence.
+skills: ["repository-map", "independent-review"]
 tools:
   allow: ["fs.read", "fs.read_many", "fs.list", "fs.glob", "fs.stat", "search.*", "shell.run", "shell.test", "git.diff", "skill.activate"]
   deny: ["fs.write", "fs.delete", "patch.apply", "deploy.*"]

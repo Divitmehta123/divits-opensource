@@ -67,13 +67,13 @@ impl ModeClassifier {
         ];
         let focused_markers = [
             "one-line",
-            "small",
+            "single-line",
+            "single file",
+            "one file",
             "localized",
             "known file",
-            ".rs",
-            ".ts",
-            ".py",
-            ".go",
+            "only this file",
+            "just this file",
             "line ",
         ];
         let agentic_hits = agentic_markers
@@ -88,17 +88,7 @@ impl ModeClassifier {
         }
         let has_action = action_markers.iter().any(|marker| lower.contains(marker));
         if has_action {
-            let reason = if focused_markers.iter().any(|marker| lower.contains(marker)) {
-                "request names a localized coding action"
-            } else if is_media_request(&lower) {
-                "request requires local media/file handling"
-            } else {
-                "request requires local actions but not a full task graph"
-            };
-            return ModeDecision {
-                mode: ExecutionMode::Focused,
-                reasons: vec![reason],
-            };
+            return action_mode_decision(request, &lower, &focused_markers);
         }
         if is_filesystem_request(&lower) {
             return ModeDecision {
@@ -110,6 +100,31 @@ impl ModeClassifier {
             mode: ExecutionMode::Direct,
             reasons: vec!["request requires no local action"],
         }
+    }
+}
+
+fn action_mode_decision(request: &str, lower: &str, focused_markers: &[&str]) -> ModeDecision {
+    if request_requires_mutation(request) {
+        if focused_markers.iter().any(|marker| lower.contains(marker)) {
+            return ModeDecision {
+                mode: ExecutionMode::Focused,
+                reasons: vec!["request explicitly limits mutation to a localized change"],
+            };
+        }
+        return ModeDecision {
+            mode: ExecutionMode::Agentic,
+            reasons: vec![
+                "coding mutation requires planning, implementation, validation, and review",
+            ],
+        };
+    }
+    ModeDecision {
+        mode: ExecutionMode::Focused,
+        reasons: vec![if is_media_request(lower) {
+            "request requires local media/file handling"
+        } else {
+            "request requires local read or execution actions"
+        }],
     }
 }
 
@@ -326,7 +341,7 @@ mod tests {
         );
         assert_eq!(
             ModeClassifier::classify("Analyze this screenshot and make the HTML").mode,
-            ExecutionMode::Focused
+            ExecutionMode::Agentic
         );
     }
 
@@ -336,12 +351,32 @@ mod tests {
             "Continue",
             "ok start the execution then as instructed",
             "go ahead and finish it",
-            "now code it",
-            "build this from that",
         ] {
             assert_eq!(
                 ModeClassifier::classify(request).mode,
                 ExecutionMode::Focused,
+                "{request}"
+            );
+        }
+        for request in ["now code it", "build this from that"] {
+            assert_eq!(
+                ModeClassifier::classify(request).mode,
+                ExecutionMode::Agentic,
+                "{request}"
+            );
+        }
+    }
+
+    #[test]
+    fn routes_substantial_mutations_through_the_agentic_runtime() {
+        for request in [
+            "Implement a provider adapter and its tests",
+            "Fix the application and run the full test suite",
+            "Build a terminal coding agent",
+        ] {
+            assert_eq!(
+                ModeClassifier::classify(request).mode,
+                ExecutionMode::Agentic,
                 "{request}"
             );
         }

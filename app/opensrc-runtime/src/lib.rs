@@ -6,6 +6,7 @@ mod compatibility;
 mod context;
 mod custom_commands;
 mod execution;
+mod local_access;
 mod local_model_compatibility;
 mod mcp;
 mod model_pack;
@@ -23,6 +24,7 @@ pub use compatibility::*;
 pub use context::*;
 pub use custom_commands::*;
 pub use execution::*;
+pub use local_access::*;
 pub use mcp::*;
 pub use model_pack::*;
 pub use provider_router::*;
@@ -46,6 +48,7 @@ pub struct Runtime {
     pub mcp: McpRegistry,
     pub model_packs: ModelPackRegistry,
     pub routing_policies: RoutingPolicyRegistry,
+    pub local_access: LocalAccessProfile,
 }
 
 impl Runtime {
@@ -100,6 +103,7 @@ impl Runtime {
             mcp,
             model_packs,
             routing_policies,
+            local_access: LocalAccessProfile::restricted(),
         }
     }
 
@@ -127,6 +131,12 @@ impl Runtime {
             .clone()
             .with_routing_policy_registry(routing_policies.clone());
         self.routing_policies = routing_policies;
+        self
+    }
+
+    #[must_use]
+    pub fn with_local_access_profile(mut self, local_access: LocalAccessProfile) -> Self {
+        self.local_access = local_access;
         self
     }
 }

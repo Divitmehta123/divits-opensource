@@ -1,6 +1,7 @@
 ---
 name: investigator
 description: Traces repository structure and code paths without changing files.
+skills: ["repository-map"]
 tools:
   allow: ["fs.read", "fs.list", "search.*", "git.diff"]
   deny: ["fs.write", "patch.apply", "shell.network"]

@@ -177,10 +177,13 @@ impl AgentControl {
         owned_paths: Vec<String>,
         allow_root_planner: bool,
     ) -> Result<Agent, AgentControlError> {
-        if let Some(path) = owned_paths.iter().find(|path| !safe_owned_path(path)) {
+        let parent = self.store.get_agent(parent_id)?;
+        if let Some(path) = owned_paths
+            .iter()
+            .find(|path| !safe_owned_path_for_parent(path, &parent))
+        {
             return Err(AgentControlError::InvalidOwnedPath(path.clone()));
         }
-        let parent = self.store.get_agent(parent_id)?;
         if !(parent.tool_policy.may_spawn_children
             || allow_root_planner && parent.parent_id.is_none())
         {
@@ -448,6 +451,10 @@ impl AgentControl {
             );
         }
 
+        let assigned_agent = task
+            .assigned_agent
+            .map(|agent_id| self.store.get_agent(agent_id))
+            .transpose()?;
         for path in task
             .contract
             .allowed_paths
@@ -455,16 +462,15 @@ impl AgentControl {
             .chain(&task.contract.forbidden_paths)
             .chain(&task.workspace_ownership)
         {
-            if !safe_owned_path(path) {
+            if !safe_task_path(path, assigned_agent.as_ref()) {
                 return invalid_task(
                     task.id,
-                    format!("path scope `{path}` is not a safe relative path"),
+                    format!("path scope `{path}` is outside the agent's safe ownership"),
                 );
             }
         }
 
-        if let Some(agent_id) = task.assigned_agent {
-            let agent = self.store.get_agent(agent_id)?;
+        if let Some(agent) = assigned_agent.as_ref() {
             if agent.run_id != task.run_id {
                 return invalid_task(task.id, "assigned agent belongs to another run");
             }
@@ -722,13 +728,20 @@ fn build_agent(
             .unwrap_or_else(|| "unconfigured".to_string()),
         reasoning: definition.reasoning.clone(),
         system_instructions: definition.system_instructions.clone(),
+        skills: definition.skills.clone(),
         context_policy: context_override.unwrap_or_else(|| definition.context_policy.clone()),
         tool_policy: definition.tool_policy.clone(),
         workspace: Workspace {
             mode: definition.workspace_mode,
             root: workspace_root,
             owned_paths: if definition.workspace_mode == opensrc_core::WorkspaceMode::OwnedPaths {
-                vec![".".to_string()]
+                let mut owned_paths = vec![".".to_string()];
+                if parent_id.is_none() && definition.sandbox_policy.trusted_local {
+                    owned_paths.extend(definition.sandbox_policy.write_paths.iter().cloned());
+                    owned_paths.sort();
+                    owned_paths.dedup();
+                }
+                owned_paths
             } else {
                 Vec::new()
             },
@@ -758,6 +771,10 @@ fn slugify(value: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
+fn safe_owned_path_for_parent(value: &str, parent: &Agent) -> bool {
+    safe_task_path(value, Some(parent))
+}
+
 fn safe_owned_path(value: &str) -> bool {
     if value.trim().is_empty() {
         return false;
@@ -767,6 +784,26 @@ fn safe_owned_path(value: &str) -> bool {
         && !path
             .components()
             .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+}
+
+fn safe_task_path(value: &str, agent: Option<&Agent>) -> bool {
+    if safe_owned_path(value) {
+        return true;
+    }
+    let Some(agent) = agent else {
+        return false;
+    };
+    let path = Path::new(value);
+    path.is_absolute()
+        && !path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+        && agent.sandbox_policy.trusted_local
+        && agent
+            .sandbox_policy
+            .write_paths
+            .iter()
+            .any(|root| scope_is_within(value, root))
 }
 
 fn workspace_is_writable(mode: WorkspaceMode) -> bool {
@@ -831,9 +868,9 @@ fn validate_task_completion(
     }
 
     for changed in &completion.files_changed {
-        if changed.contains(['*', '?']) || !safe_owned_path(changed) {
+        if changed.contains(['*', '?']) || !safe_task_path(changed, Some(agent)) {
             return invalid_completion(format!(
-                "changed file `{changed}` is not a safe relative file path"
+                "changed file `{changed}` is outside the agent's safe ownership"
             ));
         }
         if !task
@@ -1107,6 +1144,7 @@ mod tests {
             name: "investigator".to_string(),
             description: "Investigates".to_string(),
             system_instructions: "Read only".to_string(),
+            skills: Vec::new(),
             preferred_provider: None,
             preferred_model: None,
             reasoning: ReasoningConfig::default(),
@@ -1131,6 +1169,7 @@ mod tests {
             name: "implementer".to_string(),
             description: "Writes a bounded change".to_string(),
             system_instructions: "Write only owned files.".to_string(),
+            skills: Vec::new(),
             preferred_provider: Some("provider".to_string()),
             preferred_model: Some("model".to_string()),
             reasoning: ReasoningConfig::default(),
@@ -1210,6 +1249,65 @@ mod tests {
             ),
             Err(AgentControlError::SpawnDenied(_))
         ));
+    }
+
+    #[test]
+    fn trusted_root_delegates_an_absolute_external_path_with_a_valid_task_contract() {
+        let base = std::env::temp_dir().join(format!("opensrc-agent-owned-{}", Uuid::new_v4()));
+        let project = base.join("project");
+        let external = base.join("external");
+        std::fs::create_dir_all(&project).expect("project");
+        std::fs::create_dir_all(&external).expect("external");
+        let external = external.to_string_lossy().into_owned();
+        let store = Store::in_memory().expect("store");
+        let conversation = store
+            .create_conversation(project.to_string_lossy(), None)
+            .expect("conversation");
+        let run = store
+            .create_run(conversation.id, "write external", ExecutionMode::Agentic)
+            .expect("run");
+        let control = AgentControl::new(store, AgentLimits::default());
+        let mut root_definition = definition(true);
+        root_definition.sandbox_policy.trusted_local = true;
+        root_definition
+            .sandbox_policy
+            .read_paths
+            .push(base.to_string_lossy().into_owned());
+        root_definition
+            .sandbox_policy
+            .write_paths
+            .push(base.to_string_lossy().into_owned());
+        let root = control
+            .create_root(
+                run.id,
+                &root_definition,
+                "coordinate",
+                project.to_string_lossy(),
+            )
+            .expect("root");
+        let mut writer_definition = writer_definition();
+        crate::inherit_trusted_local_access(&root, &mut writer_definition);
+
+        let writer = control
+            .spawn_agent_with_ownership(
+                root.id,
+                &writer_definition,
+                "write external",
+                None,
+                vec![external.clone()],
+            )
+            .expect("external writer");
+        let task = control
+            .assign_followup(writer.id, "write external", 0)
+            .expect("external task contract");
+
+        assert!(writer.sandbox_policy.trusted_local);
+        assert_eq!(writer.workspace.owned_paths, task.workspace_ownership);
+        assert_eq!(
+            task.workspace_ownership.first().map(String::as_str),
+            Some(external.as_str())
+        );
+        std::fs::remove_dir_all(base).expect("cleanup");
     }
 
     fn valid_completion(task: &opensrc_core::Task) -> TaskCompletion {

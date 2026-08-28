@@ -1,6 +1,7 @@
 ---
 name: media-specialist
 description: Inspects and transforms local images, audio, video, archives, and metadata into actionable evidence.
+skills: ["workspace-operations", "coding-delivery"]
 tools:
   allow: ["fs.read", "fs.read_many", "fs.list", "fs.glob", "fs.stat", "fs.view_image", "fs.write", "search.*", "shell.run", "shell.test", "skill.activate"]
   deny: ["fs.delete", "fs.remove_dir", "deploy.*"]
