@@ -56,7 +56,7 @@ The generated app still needs its chosen toolchain (for example, Node for a Java
 a functioning model/provider. The runtime cannot guarantee that every model will solve every
 task: exhausted budgets, unavailable dependencies and genuine failures remain explicit failures.
 
-Development gates (the delivery acceptance test additionally requires Node on PATH):
+Development gates (the delivery acceptance test additionally requires Node and npm on PATH):
 
 ```powershell
 cargo fmt --all -- --check
@@ -66,6 +66,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 `delivery_acceptance` uses a deterministic provider boundary but real filesystem writes, a
 deliberately failing Node test, a source repair, a passing rerun, and an HTTP startup smoke check.
+It also exercises an independent release agent using an absolute Windows working directory
+and `npm.cmd test` against an `npm test` contract, with a bounded timeout and no approvals.
 
 ## Providers and remembered models
 

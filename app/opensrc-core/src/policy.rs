@@ -199,9 +199,6 @@ fn normalize_policy_path(path: &str) -> String {
     if let Some(unc) = normalized.strip_prefix("UNC/") {
         normalized = format!("//{unc}");
     }
-    if normalized.starts_with("./") {
-        normalized = normalized.trim_start_matches("./").to_string();
-    }
     if cfg!(windows) {
         normalized.make_ascii_lowercase();
     }
@@ -290,6 +287,14 @@ fn _policy_is_serializable(_: &SandboxPolicy) {}
 #[cfg(test)]
 mod tests {
     use super::path_is_owned;
+
+    #[test]
+    fn dot_prefixes_do_not_hide_parent_traversal() {
+        let owned = vec![".".to_string()];
+        assert!(path_is_owned("./src/main.rs", &owned));
+        assert!(!path_is_owned("./../outside.txt", &owned));
+        assert!(!path_is_owned("././../../outside.txt", &owned));
+    }
 
     #[test]
     #[cfg(windows)]

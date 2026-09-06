@@ -3421,6 +3421,28 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn package_manager_commands_do_not_use_powershell_script_launchers() {
+        let executor = ToolExecutor::default();
+        for command in [
+            "npm test",
+            "npm.cmd test",
+            "pnpm run build",
+            "yarn test",
+            "npx --version",
+        ] {
+            let (arguments, _) = executor
+                .normalize_arguments("shell.test", json!({"command":command}))
+                .unwrap();
+            assert_eq!(arguments["program"], "cmd.exe");
+            assert_eq!(
+                arguments["args"].as_array().unwrap().last().unwrap(),
+                command
+            );
+        }
+    }
+
+    #[test]
     fn malformed_process_arguments_fail_before_launch() {
         let executor = ToolExecutor::default();
         let error = executor

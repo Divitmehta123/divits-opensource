@@ -61,6 +61,7 @@ impl ProviderAdapter for DeliveryModel {
             "server.cjs",
             "smoke.cjs",
             "README.md",
+            "package.json",
         ];
         let events = match step {
             0 => {
@@ -73,22 +74,31 @@ impl ProviderAdapter for DeliveryModel {
                 vec![text(json!({"delivery_directory": self.directory, "tasks": [
                     {"id":"build","description":"Create the calculator source and tests with fs.write, then read back all files.","role":"implementer","dependencies":[],"owned_paths":["."],"deliverables":{"files":files,"description":"Runnable project"},"validation_steps":[]},
                     {"id":"verify","description":"Run tests, repair failures, and verify HTTP startup.","role":"test-debugging-specialist","depends_on":["build"],"owned_paths":["."],"deliverables":["Passing automated and startup checks"],"validation_steps":["node --test app.test.cjs","node smoke.cjs"]},
-                    {"id":"release","description":"Independently rerun the application tests and HTTP startup check.","role":"release-specialist","dependencies":["verify"],"owned_paths":["."],"deliverables":["Observed release evidence"],"validation_steps":["node --test app.test.cjs","node smoke.cjs"]}
+                    {"id":"release","description":"Independently rerun the application tests and HTTP startup check.","role":"release-specialist","dependencies":["verify"],"owned_paths":["."],"deliverables":["Observed release evidence"],"validation_steps":["npm test","node smoke.cjs"]}
                 ]}).to_string())]
             }
             1 => {
                 assert!(request.system.contains(&*self.directory.to_string_lossy()));
-                files.iter().zip(["module.exports = (a,b) => a-b;", TEST, "<!doctype html><title>Calculator</title><h1>Calculator</h1>", SERVER, SMOKE, "Run: node server.cjs\nTests: node --test app.test.cjs\nStartup smoke: node smoke.cjs"])
+                files.iter().zip(["module.exports = (a,b) => a-b;", TEST, "<!doctype html><title>Calculator</title><h1>Calculator</h1>", SERVER, SMOKE, "Run: node server.cjs\nTests: node --test app.test.cjs\nStartup smoke: node smoke.cjs", r#"{"name":"delivery-fixture","version":"1.0.0","scripts":{"test":"node --test app.test.cjs"}}"#])
                     .enumerate().map(|(index,(path,content))| tool(100+index,"fs.write",json!({"path":path,"content":content}))).collect()
             }
             2 => vec![tool(step, "fs.read_many", json!({"paths":files}))],
             3 => vec![text(
                 "Source and tests written and read back; validation is delegated.",
             )],
-            4 | 8 | 11 => vec![tool(
+            4 | 8 => vec![tool(
                 step,
                 "shell.test",
                 json!({"command":"node --test app.test.cjs"}),
+            )],
+            11 => vec![tool(
+                step,
+                "shell.test",
+                json!({
+                    "program": if cfg!(windows) { "npm.cmd" } else { "npm" },
+                    "args": ["test"],
+                    "cwd": if cfg!(windows) { self.directory.to_string_lossy().replace('\\', "\\\\") } else { self.directory.to_string_lossy().into_owned() }
+                }),
             )],
             // A premature completion must be rejected, not converted to fabricated passes.
             5 => vec![text("Everything passed.")],
@@ -135,6 +145,8 @@ impl ProviderAdapter for DeliveryModel {
 }
 
 #[tokio::test]
+// Keep the end-to-end setup, execution, evidence checks and cleanup in one scenario.
+#[allow(clippy::too_many_lines)]
 async fn plans_then_delivers_repairs_tests_and_starts_a_real_app_without_approvals() {
     assert!(
         std::process::Command::new("node")
@@ -169,10 +181,13 @@ async fn plans_then_delivers_repairs_tests_and_starts_a_real_app_without_approva
     let router = ProviderRouter::default();
     router.register(model.clone());
     let engine = ExecutionEngine::new(store.clone(), Arc::new(router), ToolExecutor::default());
-    engine
-        .execute_run(run.id, "delivery-fixture", "fixture")
-        .await
-        .expect("complete real delivery");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        engine.execute_run(run.id, "delivery-fixture", "fixture"),
+    )
+    .await
+    .expect("delivery must not stall on an approval or process")
+    .expect("complete real delivery");
     assert_eq!(model.step.load(Ordering::SeqCst), 15);
     assert_eq!(store.get_run(run.id).unwrap().status, RunStatus::Completed);
     assert!(store.list_approvals(false).unwrap().is_empty());
@@ -203,6 +218,22 @@ async fn plans_then_delivers_repairs_tests_and_starts_a_real_app_without_approva
                 && test.evidence.contains("exit_code=0"))
     );
     assert!(completion.unresolved.is_empty());
+    let release = store
+        .list_agents(Some(run.id))
+        .unwrap()
+        .into_iter()
+        .find(|agent| agent.role == "release-specialist")
+        .unwrap();
+    let release_completion = store.get_agent_completion(release.id).unwrap().unwrap();
+    assert_eq!(release_completion.tests.len(), 2);
+    assert!(
+        release_completion
+            .tests
+            .iter()
+            .any(|test| test.command == "npm test"
+                && test.status == EvidenceStatus::Passed
+                && test.evidence.contains("exit_code=0"))
+    );
     let events = store.events_after(0, 10_000).unwrap();
     assert!(
         events
