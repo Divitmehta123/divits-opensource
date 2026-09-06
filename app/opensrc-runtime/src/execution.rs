@@ -1,3 +1,7 @@
+use crate::delivery_workspace::{
+    default_project_directory, desktop_directory, explicit_project_directory, requests_new_project,
+    validate_delivery_directory,
+};
 use crate::local_model_compatibility::gemma_calculator_companion_artifacts;
 use crate::{
     AgentControl, AgentLimits, CompatibilityProfile, McpRegistry, ModelPack, ModelPackError,
@@ -22,6 +26,7 @@ use opensrc_store::{Store, StoreError, ToolCallClaim};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -287,10 +292,12 @@ impl ExecutionEngine {
                 if let Some(agent) = persisted_root.as_ref().filter(|agent| {
                     self.routing_policies
                         .role(&agent.role)
-                        .is_some_and(|policy| policy.execution != RoleExecutionKind::Llm)
+                        .is_some_and(|policy| {
+                            policy.execution == RoleExecutionKind::Deterministic
+                                || agent.role == "repository-mapper"
+                        })
                 }) {
                     self.execute_deterministic_root(run.id, agent, &cancellation)
-                        .await
                 } else {
                     let pack_assignment = selected_pack
                         .as_ref()
@@ -401,16 +408,40 @@ impl ExecutionEngine {
                 Ok(result)
             }
             Err(error) => {
-                if let Ok(agent) = root_agent(&self.store, run_id)
-                    && matches!(
+                self.store.append_event(
+                    run_id,
+                    root_agent_id(&self.store, run_id)?,
+                    None,
+                    "runtime.error",
+                    &json!({"error": error.to_string()}),
+                    None,
+                )?;
+                for agent in self.store.list_agents(Some(run_id))? {
+                    if matches!(
                         agent.status,
-                        AgentStatus::Queued
+                        AgentStatus::Created
+                            | AgentStatus::Queued
                             | AgentStatus::Running
                             | AgentStatus::Waiting
                             | AgentStatus::Blocked
-                    )
-                {
-                    let _ = self.store.transition_agent(agent.id, AgentStatus::Failed);
+                    ) {
+                        let next = if agent.status.can_transition_to(AgentStatus::Failed) {
+                            AgentStatus::Failed
+                        } else {
+                            AgentStatus::Interrupted
+                        };
+                        let _ = self.store.transition_agent(agent.id, next);
+                    }
+                }
+                for task in self.store.list_tasks(Some(run_id))? {
+                    if !task.status.is_terminal() {
+                        let next = if task.status.can_transition_to(TaskStatus::Failed) {
+                            TaskStatus::Failed
+                        } else {
+                            TaskStatus::Cancelled
+                        };
+                        let _ = self.store.transition_task(task.id, next);
+                    }
                 }
                 let current = self.store.get_run(run_id)?;
                 if matches!(current.status, RunStatus::Running | RunStatus::Waiting) {
@@ -543,11 +574,16 @@ impl ExecutionEngine {
                 .store
                 .transition_agent(agent.id, AgentStatus::Running)?;
         }
-        let visible_tools = contextual_visible_tools(
+        let mut visible_tools = contextual_visible_tools(
             self.tools.registry().visible_for(&agent.tool_policy),
             provider,
             user_request,
         );
+        if agent.workspace.mode == WorkspaceMode::SharedReadonly {
+            visible_tools.retain(|tool| {
+                !tool.name.starts_with("shell.") && !tool.name.starts_with("process.")
+            });
+        }
         let requires_multimodal = history.iter().any(|message| {
             message.content.iter().any(|content| {
                 matches!(
@@ -599,7 +635,16 @@ impl ExecutionEngine {
             )),
         )?;
         let mut files_read = Vec::new();
-        let effective_objective = effective_execution_objective(user_request, &messages);
+        // A reader must not inherit a writer's mutation gate from the original goal.
+        // Validation specialists are allowed to verify already-correct code without editing it.
+        let evidence_objective = effective_execution_objective(user_request, &messages);
+        let requires_own_mutation = agent.workspace.mode != WorkspaceMode::SharedReadonly
+            && !(task_id.is_some() && stage_for_role(&agent.role) == ModelPackStage::Validate);
+        let effective_objective = if requires_own_mutation {
+            evidence_objective
+        } else {
+            String::new()
+        };
         let image_references = relevant_image_references(&messages, user_request);
         let mut preflight_tool_calls = 0;
         if let Some(target) = deterministic_directory_inventory_target(user_request)
@@ -1175,7 +1220,16 @@ impl ExecutionEngine {
                     &files_changed,
                     successful_mutation_tools,
                     &pending_file_validation,
-                ) {
+                )
+                .or_else(|| {
+                    missing_validation_evidence(
+                        task_id.and_then(|id| self.store.get_task(id).ok()).as_ref(),
+                        &test_evidence,
+                    )
+                }).or_else(|| {
+                    (task_id.is_some() && stage_for_role(&agent.role) == ModelPackStage::Validate && test_evidence.is_empty())
+                        .then(|| "the validation role must run actual checks with shell.test before completing".to_string())
+                }) {
                     self.store.append_event(
                         run_id,
                         Some(agent.id),
@@ -1255,23 +1309,6 @@ impl ExecutionEngine {
                 let tests_passed = test_evidence
                     .iter()
                     .all(|test: &TestEvidence| test.status == EvidenceStatus::Passed);
-                if tests_passed && let Some(task) = bound_task.as_ref() {
-                    for validation in &task.contract.validation_steps {
-                        if !test_evidence
-                            .iter()
-                            .any(|test| test.command.trim() == validation.trim())
-                        {
-                            test_evidence.push(TestEvidence {
-                                command: validation.clone(),
-                                status: EvidenceStatus::Passed,
-                                evidence: format!(
-                                    "Runtime completion gate observed a final response, {tool_calls} tool calls, and {} changed files.",
-                                    files_changed.len()
-                                ),
-                            });
-                        }
-                    }
-                }
                 let completion_status = if tests_passed {
                     CompletionStatus::Completed
                 } else {
@@ -1676,7 +1713,23 @@ impl ExecutionEngine {
                             } {
                                 Ok(result) => {
                                     let output = serde_json::to_value(&result)?;
-                                    self.store.finish_tool_call(id, "completed", &output)?;
+                                    if let Some(error) = result
+                                        .output
+                                        .get("invocation_error")
+                                        .and_then(Value::as_str)
+                                    {
+                                        non_retryable_tool_failures
+                                            .insert(signature.clone(), error.to_string());
+                                    }
+                                    self.store.finish_tool_call(
+                                        id,
+                                        if tool_output_failed(&output) {
+                                            "failed"
+                                        } else {
+                                            "completed"
+                                        },
+                                        &output,
+                                    )?;
                                     if is_mutation_tool(&name) {
                                         successful_mutation_tools =
                                             successful_mutation_tools.saturating_add(1);
@@ -1714,8 +1767,20 @@ impl ExecutionEngine {
                                         }
                                     }
                                     if matches!(name.as_str(), "shell.run" | "shell.test") {
-                                        let command = process_command_summary(&effective_arguments);
-                                        if name == "shell.test" {
+                                        let command = task_id
+                                            .and_then(|id| self.store.get_task(id).ok())
+                                            .and_then(|task| {
+                                                task.contract.validation_steps.into_iter().find(
+                                                    |required| {
+                                                        validation_command_identity(required)
+                                                            == validation_command_identity(&target)
+                                                    },
+                                                )
+                                            })
+                                            .unwrap_or_else(|| target.clone());
+                                        if name == "shell.test"
+                                            && result.output.get("invocation_error").is_none()
+                                        {
                                             tests_run.push(command.clone());
                                             let success = result
                                                 .output
@@ -1727,7 +1792,7 @@ impl ExecutionEngine {
                                                 .get("exit_code")
                                                 .and_then(Value::as_i64);
                                             let evidence = format!(
-                                                "exit_code={}; stdout={}; stderr={}",
+                                                "executed={target}; exit_code={}; stdout={}; stderr={}",
                                                 exit_code.map_or_else(
                                                     || "unknown".to_string(),
                                                     |code| code.to_string()
@@ -1743,6 +1808,11 @@ impl ExecutionEngine {
                                                     .and_then(Value::as_str)
                                                     .unwrap_or_default()
                                             );
+                                            // Retain every attempt in the event log; the completion
+                                            // ledger records the latest rerun of each exact command.
+                                            test_evidence.retain(|test: &TestEvidence| {
+                                                test.command != command
+                                            });
                                             test_evidence.push(TestEvidence {
                                                 command: command.clone(),
                                                 status: if success {
@@ -1751,6 +1821,12 @@ impl ExecutionEngine {
                                                     EvidenceStatus::Failed
                                                 },
                                                 evidence,
+                                            });
+                                            unresolved.retain(|entry| {
+                                                entry
+                                                    != &format!(
+                                                        "Required validation failed: {command}"
+                                                    )
                                             });
                                             if !success {
                                                 unresolved.push(format!(
@@ -1821,7 +1897,7 @@ impl ExecutionEngine {
                         "call_id": call_id,
                         "name": name,
                         "target": target,
-                        "status": if output.get("error").is_some() {
+                        "status": if tool_output_failed(&output) {
                             "failed"
                         } else {
                             "completed"
@@ -2114,12 +2190,10 @@ impl ExecutionEngine {
                 let task_description = task.description.clone();
                 let deterministic = role_policy
                     .as_ref()
-                    .is_some_and(|policy| policy.execution != RoleExecutionKind::Llm);
+                    .is_some_and(|policy| policy.execution == RoleExecutionKind::Deterministic);
                 tokio::spawn(async move {
                     let execution = if deterministic {
-                        engine
-                            .execute_deterministic_task(run_id, &task, &child, &cancellation)
-                            .await
+                        engine.execute_deterministic_task(run_id, &task, &child, &cancellation)
                     } else {
                         engine
                             .execute_focused(
@@ -2361,12 +2435,15 @@ impl ExecutionEngine {
         }
     }
 
-    async fn execute_deterministic_root(
+    fn execute_deterministic_root(
         &self,
         run_id: RunId,
         agent: &Agent,
         cancellation: &CancellationToken,
     ) -> Result<RunExecutionResult, ExecutionError> {
+        if cancellation.is_cancelled() {
+            return Err(ExecutionError::Cancelled(run_id));
+        }
         let started = Instant::now();
         let agent = if agent.status == AgentStatus::Queued {
             self.store
@@ -2404,9 +2481,6 @@ impl ExecutionEngine {
                     Vec::new(),
                     Vec::new(),
                 )
-            }
-            "release-specialist" => {
-                run_release_gates(run_id, Path::new(&agent.workspace.root), cancellation).await?
             }
             role => {
                 return Err(ExecutionError::DeterministicService(format!(
@@ -2466,13 +2540,16 @@ impl ExecutionEngine {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn execute_deterministic_task(
+    fn execute_deterministic_task(
         &self,
         run_id: RunId,
         task: &opensrc_core::Task,
         agent: &Agent,
         cancellation: &CancellationToken,
     ) -> Result<RunExecutionResult, ExecutionError> {
+        if cancellation.is_cancelled() {
+            return Err(ExecutionError::Cancelled(run_id));
+        }
         let started = Instant::now();
         self.store.append_event(
             run_id,
@@ -2509,9 +2586,6 @@ impl ExecutionEngine {
                     Vec::new(),
                 )
             }
-            "release-specialist" => {
-                run_release_gates(run_id, Path::new(&agent.workspace.root), cancellation).await?
-            }
             role => {
                 return Err(ExecutionError::DeterministicService(format!(
                     "role `{role}` has no deterministic service implementation"
@@ -2524,8 +2598,9 @@ impl ExecutionEngine {
             .iter()
             .map(|criterion| ContractCheck {
                 criterion: criterion.clone(),
-                status: EvidenceStatus::Passed,
-                evidence: "Deterministic runtime service completed successfully.".to_string(),
+                status: EvidenceStatus::Unavailable,
+                evidence: "This deterministic service cannot verify arbitrary acceptance criteria."
+                    .to_string(),
             })
             .collect();
         let tests = task
@@ -2534,8 +2609,8 @@ impl ExecutionEngine {
             .iter()
             .map(|validation| TestEvidence {
                 command: validation.clone(),
-                status: EvidenceStatus::Passed,
-                evidence: "Validated by the deterministic runtime service.".to_string(),
+                status: EvidenceStatus::Unavailable,
+                evidence: "This deterministic service did not execute this command.".to_string(),
             })
             .collect();
         let completion = TaskCompletion {
@@ -2668,6 +2743,24 @@ impl ExecutionEngine {
             .providers
             .resolve(planner_provider, &RequiredCapabilities::default())
             .is_ok_and(|adapter| adapter.capabilities().supports_structured_output);
+        let delivery_default =
+            if root.sandbox_policy.trusted_local && requests_new_project(user_request) {
+                explicit_project_directory(user_request).or_else(|| {
+                    desktop_directory().map(|desktop| {
+                        default_project_directory(&desktop, user_request, &run_id.to_string()[..8])
+                    })
+                })
+            } else {
+                None
+            };
+        let mut planner_system = agentic_planner_prompt(&root);
+        if let Some(path) = &delivery_default {
+            let _ = write!(
+                planner_system,
+                "\nNEW PROJECT DELIVERY: Use delivery_directory = {} unless the user explicitly named another absolute destination. This is a NEW application, not work on the coding agent's own source. All owned_paths should be relative to this delivery folder. Keep code, tests, assets and README there. Include a writer and a validation task that runs real tests and a startup smoke check. Validation steps must be exact shell.test commands, not prose. Do not inspect the launcher repository. Final handoff must contain the absolute folder, tested startup command, and exact check results.",
+                serde_json::to_string(&path.to_string_lossy())?
+            );
+        }
         self.store.append_event(
             run_id,
             Some(root.id),
@@ -2683,7 +2776,7 @@ impl ExecutionEngine {
         )?;
         let plan_request = CanonicalModelRequest {
             model: planner_model.to_string(),
-            system: agentic_planner_prompt(&root),
+            system: planner_system,
             messages: planner_history
                 .into_iter()
                 .map(message_to_canonical)
@@ -2700,7 +2793,7 @@ impl ExecutionEngine {
                 })
                 .or_else(|| root.reasoning.level.clone()),
             temperature: Some(0.1),
-            max_output_tokens: Some(4_000),
+            max_output_tokens: Some(10_000),
             cache_hints: BTreeMap::new(),
         };
         let plan_started = Instant::now();
@@ -2723,7 +2816,9 @@ impl ExecutionEngine {
             &aggregate_usage,
             0,
         )?;
-        let planned = parse_agentic_plan(&plan_text).unwrap_or_else(|| {
+        let mut planned = parse_agentic_plan(&plan_text).filter(|plan| {
+            !request_requires_mutation(user_request) || plan.tasks.iter().any(|task| !task.owned_paths.is_empty())
+        }).unwrap_or_else(|| {
             let _ = self.store.append_event(
                 run_id,
                 Some(root.id),
@@ -2737,6 +2832,14 @@ impl ExecutionEngine {
             );
             fallback_agentic_plan(user_request)
         });
+        if planned.delivery_directory.is_none()
+            || (requests_new_project(user_request)
+                && explicit_project_directory(user_request).is_some())
+        {
+            planned.delivery_directory =
+                delivery_default.map(|path| path.to_string_lossy().into_owned());
+        }
+        validate_plan_before_execution(&planned, &root.workspace.root)?;
         if planned.tasks.is_empty() || planned.tasks.len() > 8 {
             return Err(ExecutionError::InvalidAgentPlan(
                 "the planner must return between one and eight tasks".to_string(),
@@ -2749,10 +2852,37 @@ impl ExecutionEngine {
             "agent.plan_created",
             &json!({
                 "task_count": planned.tasks.len(),
-                "roles": planned.tasks.iter().map(|task| task.role.as_str()).collect::<Vec<_>>()
+                "roles": planned.tasks.iter().map(|task| task.role.as_str()).collect::<Vec<_>>(),
+                "delivery_directory": planned.delivery_directory,
+                "tasks": planned.tasks.iter().map(|task| json!({"id": task.id, "description": task.description, "dependencies": task.dependencies, "validation_steps": task.validation_steps})).collect::<Vec<_>>()
             }),
             None,
         )?;
+
+        if let Some(directory) = &planned.delivery_directory {
+            if !request_requires_mutation(user_request) {
+                return Err(ExecutionError::InvalidAgentPlan(
+                    "read-only requests cannot select a new delivery workspace".into(),
+                ));
+            }
+            let path =
+                validate_delivery_directory(directory).map_err(ExecutionError::InvalidAgentPlan)?;
+            let conversation_id = self.store.get_run(run_id)?.conversation_id;
+            self.execute_preflight_tool(
+                &mut root,
+                run_id,
+                conversation_id,
+                planner_provider,
+                planner_model,
+                "fs.mkdir",
+                json!({"path": path.to_string_lossy()}),
+                cancellation,
+            )
+            .await?;
+            root = self
+                .store
+                .set_root_workspace(root.id, &path.to_string_lossy())?;
+        }
 
         let control = AgentControl::new(self.store.clone(), self.agent_limits.clone());
         let identifiers = planned
@@ -3059,7 +3189,7 @@ impl ExecutionEngine {
                 let deterministic = self
                     .routing_policies
                     .role(&child.role)
-                    .is_some_and(|policy| policy.execution != RoleExecutionKind::Llm);
+                    .is_some_and(|policy| policy.execution == RoleExecutionKind::Deterministic);
                 let cancellation = cancellation.clone();
                 self.store.append_event(
                     run_id,
@@ -3077,9 +3207,7 @@ impl ExecutionEngine {
                 )?;
                 round.push(async move {
                     let result = if deterministic {
-                        engine
-                            .execute_deterministic_task(run_id, &task, &child, &cancellation)
-                            .await
+                        engine.execute_deterministic_task(run_id, &task, &child, &cancellation)
                     } else {
                         engine
                             .execute_focused(
@@ -3197,6 +3325,22 @@ impl ExecutionEngine {
             }),
             None,
         )?;
+        let child_completions = self
+            .store
+            .list_agents(Some(run_id))?
+            .into_iter()
+            .filter(|agent| agent.parent_id.is_some())
+            .filter_map(|agent| self.store.get_agent_completion(agent.id).transpose())
+            .collect::<Result<Vec<_>, _>>()?;
+        let observed_tests = child_completions
+            .iter()
+            .flat_map(|completion| completion.tests.clone())
+            .collect::<Vec<_>>();
+        if planned.delivery_directory.is_some()
+            && (self.store.list_file_changes(Some(run_id))?.is_empty() || observed_tests.is_empty())
+        {
+            return Err(ExecutionError::IncompleteOutcome("new application delivery requires recorded source changes and executed validation commands".into()));
+        }
         let synthesis_request = CanonicalModelRequest {
             model: synthesis_model.to_string(),
             system: "Integrate the completed specialist reports into one concise final response. \
@@ -3207,7 +3351,12 @@ impl ExecutionEngine {
                 CanonicalMessage::text(MessageRole::User, user_request),
                 CanonicalMessage::text(
                     MessageRole::Developer,
-                    format!("Specialist reports:\n\n{}", summaries.join("\n\n")),
+                    format!(
+                        "Delivery directory: {}\nRecorded checks: {}\nSpecialist reports:\n\n{}",
+                        root.workspace.root,
+                        serde_json::to_string(&observed_tests)?,
+                        summaries.join("\n\n")
+                    ),
                 ),
             ],
             tools: Vec::new(),
@@ -3268,7 +3417,11 @@ impl ExecutionEngine {
                 .map(|change| change.relative_path)
                 .collect(),
             commands_run: Vec::new(),
-            tests_run: Vec::new(),
+            tests_run: observed_tests
+                .iter()
+                .map(|test| test.command.clone())
+                .collect(),
+            tests: observed_tests,
             risks: Vec::new(),
             unresolved: Vec::new(),
             recommended_next_actions: Vec::new(),
@@ -3559,9 +3712,7 @@ impl ExecutionEngine {
                         .to_string(),
                 ],
                 deliverables: vec!["A schema-valid independent review contract.".to_string()],
-                validation_steps: vec![
-                    "Inspect the repair diff and its validation evidence.".to_string(),
-                ],
+                validation_steps: Vec::new(),
                 forbidden_actions: vec![
                     "Do not approve without independently inspecting the repair evidence."
                         .to_string(),
@@ -4539,105 +4690,10 @@ fn collect_manifest_dependencies(
     }
 }
 
-async fn run_release_gates(
-    run_id: RunId,
-    root: &Path,
-    cancellation: &CancellationToken,
-) -> Result<(String, Vec<String>, Vec<String>, Vec<String>), ExecutionError> {
-    let gates: Vec<(&str, &str, Vec<&str>)> = if root.join("Cargo.toml").is_file() {
-        vec![
-            ("format", "cargo", vec!["fmt", "--all", "--", "--check"]),
-            (
-                "tests",
-                "cargo",
-                vec!["test", "--workspace", "--all-targets"],
-            ),
-            (
-                "lint",
-                "cargo",
-                vec![
-                    "clippy",
-                    "--workspace",
-                    "--all-targets",
-                    "--",
-                    "-D",
-                    "warnings",
-                ],
-            ),
-            ("build", "cargo", vec!["build", "--workspace", "--release"]),
-        ]
-    } else {
-        return Err(ExecutionError::DeterministicService(
-            "no supported release manifest was found; no release gate was bypassed".to_string(),
-        ));
-    };
-    let mut commands = Vec::new();
-    let mut tests = Vec::new();
-    let mut report = Vec::new();
-    for (name, program, arguments) in gates {
-        let command = format!("{program} {}", arguments.join(" "));
-        commands.push(command.clone());
-        if name == "tests" {
-            tests.push(command.clone());
-        }
-        let mut process = tokio::process::Command::new(program);
-        process
-            .args(&arguments)
-            .current_dir(root)
-            .kill_on_drop(true);
-        let output = tokio::select! {
-            () = cancellation.cancelled() => return Err(ExecutionError::Cancelled(run_id)),
-            result = tokio::time::timeout(
-                std::time::Duration::from_secs(900),
-                process.output()
-            ) => result
-                .map_err(|_| ExecutionError::DeterministicService(format!(
-                    "release gate `{name}` timed out"
-                )))?
-                .map_err(|error| ExecutionError::DeterministicService(format!(
-                    "release gate `{name}` could not start: {error}"
-                )))?
-        };
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        report.push(format!(
-            "{name}: {}",
-            if output.status.success() {
-                "passed"
-            } else {
-                "failed"
-            }
-        ));
-        if !output.status.success() {
-            return Err(ExecutionError::DeterministicService(format!(
-                "release gate `{name}` failed for `{command}`\n{}\n{}",
-                truncate_evidence(&stdout),
-                truncate_evidence(&stderr)
-            )));
-        }
-    }
-    Ok((
-        format!(
-            "Deterministic release gates passed with zero model calls.\n{}",
-            report.join("\n")
-        ),
-        Vec::new(),
-        commands,
-        tests,
-    ))
-}
-
-fn truncate_evidence(value: &str) -> String {
-    const MAXIMUM: usize = 4_000;
-    if value.len() <= MAXIMUM {
-        value.to_string()
-    } else {
-        format!("{}…", &value[..MAXIMUM])
-    }
-}
-
 #[derive(Debug, Deserialize)]
 struct AgenticPlan {
+    #[serde(default)]
+    delivery_directory: Option<String>,
     tasks: Vec<PlannedTask>,
 }
 
@@ -4649,7 +4705,11 @@ struct PlannedTask {
     description: String,
     #[serde(default = "default_agentic_role", alias = "specialist")]
     role: String,
-    #[serde(default, deserialize_with = "deserialize_string_list")]
+    #[serde(
+        default,
+        alias = "depends_on",
+        deserialize_with = "deserialize_string_list"
+    )]
     dependencies: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_string_list")]
     owned_paths: Vec<String>,
@@ -5203,9 +5263,9 @@ fn validate_planned_task(id: &str, task: &PlannedTask) -> Result<(), ExecutionEr
             "task `{id}` has no measurable acceptance criteria"
         )));
     }
-    if task.deliverables.is_empty() || task.validation_steps.is_empty() {
+    if task.deliverables.is_empty() {
         return Err(ExecutionError::InvalidAgentPlan(format!(
-            "task `{id}` must declare deliverables and validation steps"
+            "task `{id}` must declare deliverables"
         )));
     }
     Ok(())
@@ -5229,18 +5289,31 @@ fn agentic_planner_prompt(root: &Agent) -> String {
     };
     format!(
         "You are the root planner for a real local coding-agent runtime. Build a dependency-aware \
-         plan that will be executed, not a prose suggestion. Return only schema-valid JSON.\n\n\
+         plan that will be executed, not a prose suggestion. Return only schema-valid JSON.\n\
+         CURRENT WORKING/DELIVERY DIRECTORY: {}. For follow-up work this is the saved project \
+         directory; use it and relative owned_paths. Never guess a different Desktop location.\n\n\
          Rules:\n\
-         - Use one to eight bounded tasks; avoid delegation for work one focused agent can finish.\n\
+         - Use one to eight bounded tasks; prefer two or three tasks and concise one-sentence \
+           fields so the complete JSON fits in the response. Avoid unnecessary delegation.\n\
          - Every task needs a concrete objective, measurable acceptance criteria, deliverables, \
            validation steps, forbidden actions, and contract notes for downstream agents.\n\
          - Dependencies contain task ids. Dependent agents receive predecessor completion objects.\n\
          - Give writing tasks narrow, non-overlapping owned_paths. Use `.` only when the change \
            genuinely spans the project; read-only tasks use an empty list.\n\
          - For implementation work, include validation and independent review when useful.\n\
+         - A task running build/test commands from the project root needs owned_paths containing `.` \
+           because those commands may write build outputs. Put it after other writers.\n\
+         - validation_steps contains only exact executable shell.test commands. Use [] for \
+           read-only/prose checks and put their descriptions in acceptance_criteria. Never mark \
+           a check passed unless it actually ran.\n\
+         - delivery_directory is null for existing-project edits. For a NEW app it is the absolute \
+           destination folder (prefer the user's Desktop unless they named another location).\n\
          - Select the specialist by work type, never by model name. The runtime assigns models.\n\
          - Do not invent files, tools, providers, results, or completed work.{local_access}\n\n\
-         Available specialist roles:\n{roles}"
+         Available specialist roles:\n{roles}\n\n\
+         JSON schema (also mandatory when native structured output is unavailable):\n{}",
+        root.workspace.root,
+        agentic_plan_schema()
     )
 }
 
@@ -5248,6 +5321,7 @@ fn agentic_plan_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
+            "delivery_directory": {"type": ["string", "null"]},
             "tasks": {
                 "type": "array",
                 "minItems": 1,
@@ -5303,29 +5377,16 @@ fn agentic_plan_schema() -> Value {
                 }
             }
         },
-        "required": ["tasks"],
+        "required": ["tasks", "delivery_directory"],
         "additionalProperties": false
     })
 }
 
 fn fallback_agentic_plan(user_request: &str) -> AgenticPlan {
-    let mutation = user_request.to_ascii_lowercase();
-    let mutation = [
-        "build",
-        "create",
-        "implement",
-        "fix",
-        "edit",
-        "write",
-        "update",
-        "change",
-        "refactor",
-        "replicate",
-    ]
-    .iter()
-    .any(|marker| mutation.contains(marker));
+    let mutation = request_requires_mutation(user_request);
     if !mutation {
         return AgenticPlan {
+            delivery_directory: None,
             tasks: vec![
                 planned_task(
                     "investigate",
@@ -5347,6 +5408,7 @@ fn fallback_agentic_plan(user_request: &str) -> AgenticPlan {
         };
     }
     AgenticPlan {
+        delivery_directory: None,
         tasks: vec![
             planned_task(
                 "inspect",
@@ -5406,9 +5468,7 @@ fn planned_task(
             .collect(),
         acceptance_criteria: vec![acceptance.to_string()],
         deliverables: vec!["A structured completion with exact evidence.".to_string()],
-        validation_steps: vec![
-            "Inspect the resulting files or outputs before reporting completion.".to_string(),
-        ],
+        validation_steps: Vec::new(),
         forbidden_actions: vec![
             "Do not claim actions, tests, or files that were not observed.".to_string(),
         ],
@@ -5562,7 +5622,136 @@ fn parse_agentic_plan(value: &str) -> Option<AgenticPlan> {
         .or_else(|| trimmed.strip_prefix("```"))
         .and_then(|body| body.strip_suffix("```"))
         .map_or(trimmed, str::trim);
-    serde_json::from_str(json).ok().map(normalize_agentic_plan)
+    let mut value: Value = serde_json::from_str(json).ok()?;
+    // Common text-mode contract variation. Only normalize this documented shape;
+    // unknown objects remain invalid instead of silently discarding deliverables.
+    for task in value.get_mut("tasks")?.as_array_mut()? {
+        if let Some(object) = task.get("deliverables").and_then(Value::as_object) {
+            if object
+                .keys()
+                .any(|key| !matches!(key.as_str(), "files" | "description"))
+            {
+                return None;
+            }
+            let mut items = object
+                .get("files")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(description) = object.get("description").and_then(Value::as_str) {
+                items.push(Value::String(description.to_string()));
+            }
+            task["deliverables"] = Value::Array(items);
+        }
+    }
+    serde_json::from_value(value)
+        .ok()
+        .map(normalize_agentic_plan)
+}
+
+fn validate_plan_before_execution(
+    plan: &AgenticPlan,
+    workspace: &str,
+) -> Result<(), ExecutionError> {
+    if plan.tasks.is_empty() || plan.tasks.len() > 8 {
+        return Err(ExecutionError::InvalidAgentPlan(
+            "expected one to eight tasks".into(),
+        ));
+    }
+    let ids = plan
+        .tasks
+        .iter()
+        .enumerate()
+        .map(|(index, task)| {
+            task.id
+                .clone()
+                .unwrap_or_else(|| format!("task-{}", index + 1))
+        })
+        .collect::<Vec<_>>();
+    let all = ids.iter().cloned().collect::<BTreeSet<_>>();
+    if all.len() != ids.len() {
+        return Err(ExecutionError::InvalidAgentPlan(
+            "task ids must be unique".into(),
+        ));
+    }
+    for (id, task) in ids.iter().zip(&plan.tasks) {
+        validate_planned_task(id, task)?;
+        let role = resolve_agent_definition(workspace, &task.role)?;
+        if role.workspace_mode == WorkspaceMode::OwnedPaths && task.owned_paths.is_empty() {
+            return Err(ExecutionError::InvalidAgentPlan(format!(
+                "writing task {id} must declare owned_paths"
+            )));
+        }
+        if task
+            .dependencies
+            .iter()
+            .any(|dep| dep == id || !all.contains(dep))
+        {
+            return Err(ExecutionError::InvalidAgentPlan(format!(
+                "task {id} has an unknown or self dependency"
+            )));
+        }
+    }
+    let mut completed = BTreeSet::new();
+    loop {
+        let before = completed.len();
+        for (id, task) in ids.iter().zip(&plan.tasks) {
+            if task.dependencies.iter().all(|dep| completed.contains(dep)) {
+                completed.insert(id.clone());
+            }
+        }
+        if completed.len() == all.len() {
+            return Ok(());
+        }
+        if before == completed.len() {
+            return Err(ExecutionError::InvalidAgentPlan("dependency cycle".into()));
+        }
+    }
+}
+
+fn tool_output_failed(value: &Value) -> bool {
+    let output = value.get("output").unwrap_or(value);
+    value.get("error").is_some()
+        || output.get("success") == Some(&Value::Bool(false))
+        || output
+            .get("exit_code")
+            .and_then(Value::as_i64)
+            .is_some_and(|code| code != 0)
+}
+
+fn missing_validation_evidence(
+    task: Option<&opensrc_core::Task>,
+    tests: &[TestEvidence],
+) -> Option<String> {
+    let failed = tests
+        .iter()
+        .filter(|test| test.status != EvidenceStatus::Passed)
+        .map(|test| test.command.as_str())
+        .collect::<Vec<_>>();
+    if !failed.is_empty() {
+        return Some(format!(
+            "repair and rerun failed shell.test commands: {}",
+            failed.join(", ")
+        ));
+    }
+    let task = task?;
+    let missing = task
+        .contract
+        .validation_steps
+        .iter()
+        .filter(|command| {
+            !tests.iter().any(|test| {
+                test.command.trim() == command.trim() && test.status == EvidenceStatus::Passed
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    (!missing.is_empty()).then(|| {
+        format!(
+            "execute these required shell.test commands (with command set to the exact string): {}",
+            missing.join("; ")
+        )
+    })
 }
 
 fn normalize_agentic_plan(mut plan: AgenticPlan) -> AgenticPlan {
@@ -5574,11 +5763,6 @@ fn normalize_agentic_plan(mut plan: AgenticPlan) -> AgenticPlan {
         if task.deliverables.is_empty() {
             task.deliverables
                 .push("A structured completion with exact evidence.".to_string());
-        }
-        if task.validation_steps.is_empty() {
-            task.validation_steps.push(
-                "Inspect the resulting files or outputs before reporting completion.".to_string(),
-            );
         }
         if task.forbidden_actions.is_empty() {
             task.forbidden_actions
@@ -6288,10 +6472,28 @@ fn safe_artifact_path(candidate: &str) -> Option<String> {
 }
 
 fn process_command_summary(arguments: &Value) -> String {
+    if let Some(command) = arguments.get("command").and_then(Value::as_str) {
+        return command.trim().to_string();
+    }
     let program = arguments
         .get("program")
         .and_then(Value::as_str)
         .unwrap_or("process");
+    // Normalization wraps `command` in the host shell before the model loop.
+    // Preserve the original command identity for exact validation reruns.
+    if matches!(
+        program,
+        "powershell.exe" | "pwsh" | "pwsh.exe" | "cmd.exe" | "/bin/sh"
+    ) && let Some(args) = arguments.get("args").and_then(Value::as_array)
+        && let Some(pair) = args.windows(2).find(|pair| {
+            pair[0]
+                .as_str()
+                .is_some_and(|arg| matches!(arg, "-Command" | "/C" | "-lc" | "-c"))
+        })
+        && let Some(command) = pair[1].as_str()
+    {
+        return command.to_string();
+    }
     let args = arguments
         .get("args")
         .and_then(Value::as_array)
@@ -6305,6 +6507,20 @@ fn process_command_summary(arguments: &Value) -> String {
     } else {
         format!("{program} {}", args.join(" "))
     }
+}
+
+fn validation_command_identity(command: &str) -> String {
+    let command = command.trim();
+    if cfg!(windows) {
+        let end = command.find(char::is_whitespace).unwrap_or(command.len());
+        let program = &command[..end];
+        // These Windows package-manager shims implement the same command. Preserve
+        // every argument and do not equate different scripts, flags or arbitrary paths.
+        if matches!(program, "npm.cmd" | "npx.cmd" | "pnpm.cmd" | "yarn.cmd") {
+            return format!("{}{}", &program[..program.len() - 4], &command[end..]);
+        }
+    }
+    command.to_string()
 }
 
 fn quote_command_argument(value: &str) -> String {
@@ -6342,8 +6558,22 @@ fn focused_system_prompt(agent: &Agent, skills: &SkillRegistry, mcp: &McpRegistr
         .map(|server| server.name)
         .collect::<Vec<_>>()
         .join(", ");
+    let scope_instruction = if agent.workspace.mode == WorkspaceMode::SharedReadonly {
+        "READ-ONLY INSPECTION STAGE: Your deliverable is findings for downstream writers, not implementation. Missing files, tests, or server are findings. Report them and finish; do not try to create or repair them, and do not demand that the original application be finished before you hand off. Arbitrary processes are unavailable in this role."
+    } else {
+        "WRITING STAGE: Use fs.write/patch tools for durable source changes and batch independent writes. Run required checks with shell.test."
+    };
     format!(
-        "{}\n\nDedicated role skills are already active for this run. Follow them as \
+        "{}\n\n{}\nHost OS: {}. Working/delivery directory: {}. Owned paths: {:?}. \
+         On Windows prefer direct program/args, never nested cmd/PowerShell wrappers or Bash heredocs. \
+         For Node/Python checks, save a script using fs.write and execute the script; avoid inline \
+         code with multiple levels of shell quoting. For npm/pnpm on Windows use npm.cmd/pnpm.cmd. Use fs.write \
+         for file contents. Run commands with cwd set to the delivery directory. Keep all \
+         deliverable files, tests, assets and startup documentation together. Use shell.test for \
+         exact validation commands and process.start/process.poll for a long-running app. Verify \
+         startup with a real smoke check; fix errors and rerun failed checks before completion. \
+         A read-only role must report evidence without creating files.\n\n\
+         Dedicated role skills are already active for this run. Follow them as \
          mandatory execution guidance:\n\n{}\n\nYou are in focused coding mode. Batch independent reads and searches. \
          Use only the exposed tools. Prefer patch.apply with an expected SHA-256 for edits. \
          When the user asks about local files, folders, directories, disks, or drives, inspect \
@@ -6369,6 +6599,10 @@ fn focused_system_prompt(agent: &Agent, skills: &SkillRegistry, mcp: &McpRegistr
          Enabled MCP servers: {}. Use mcp.list_tools before invoking an unfamiliar MCP tool. \
          When validation is complete, return the concise final answer without another tool call.",
         agent.system_instructions,
+        scope_instruction,
+        std::env::consts::OS,
+        agent.workspace.root,
+        agent.workspace.owned_paths,
         if dedicated_skills.is_empty() {
             "none".to_string()
         } else {
@@ -6393,7 +6627,6 @@ fn contextual_visible_tools(
     user_request: &str,
 ) -> Vec<ToolDescriptor> {
     let request = user_request.to_ascii_lowercase();
-    let mutation = request_requires_mutation(&request);
     let contains_any = |needles: &[&str]| needles.iter().any(|needle| request.contains(needle));
     let mut relevant = BTreeSet::from([
         "fs.read",
@@ -6404,17 +6637,20 @@ fn contextual_visible_tools(
         "fs.view_image",
         "search.text",
         "skill.activate",
+        // These are already filtered by the role's tool policy. Do not hide
+        // repair/validation capabilities because the task says "validate"
+        // instead of repeating a particular mutation keyword.
+        "fs.mkdir",
+        "fs.write",
+        "fs.edit_exact",
+        "patch.apply",
+        "shell.run",
+        "shell.test",
+        "process.start",
+        "process.poll",
+        "process.input",
+        "process.kill",
     ]);
-    if mutation {
-        relevant.extend([
-            "fs.mkdir",
-            "fs.write",
-            "fs.edit_exact",
-            "patch.apply",
-            "shell.run",
-            "shell.test",
-        ]);
-    }
     if contains_any(&["copy", "duplicate"]) {
         relevant.insert("fs.copy");
     }
@@ -6828,6 +7064,69 @@ mod tests {
         });
         assert_eq!(provider_retry_wait_ms(&error, 500, 30_000), 12_000);
         assert_eq!(provider_retry_wait_ms(&error, 500, 5_000), 5_000);
+    }
+
+    #[test]
+    fn make_requests_get_writers_even_when_planner_json_is_invalid() {
+        let plan = super::fallback_agentic_plan("Make a working black and white calculator");
+        assert!(
+            plan.tasks
+                .iter()
+                .any(|task| task.role == "implementer" && !task.owned_paths.is_empty())
+        );
+        assert!(
+            plan.tasks
+                .iter()
+                .any(|task| task.role == "test-debugging-specialist")
+        );
+        super::validate_plan_before_execution(&plan, ".").unwrap();
+    }
+
+    #[test]
+    fn cyclic_plan_is_rejected_before_workspace_preparation() {
+        let mut plan = super::fallback_agentic_plan("Make a calculator");
+        plan.tasks[0].dependencies = vec!["review".into()];
+        assert!(super::validate_plan_before_execution(&plan, ".").is_err());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_package_shims_preserve_validation_identity_but_not_different_checks() {
+        assert_eq!(
+            super::validation_command_identity("npm.cmd test"),
+            "npm test"
+        );
+        assert_ne!(
+            super::validation_command_identity("npm.cmd test -- --watch"),
+            "npm test"
+        );
+        assert_ne!(
+            super::validation_command_identity("npm.cmd run lint"),
+            "npm test"
+        );
+        assert_ne!(
+            super::validation_command_identity("C:\\other\\npm.cmd test"),
+            "npm test"
+        );
+    }
+
+    #[test]
+    fn normalized_shell_commands_retain_their_validation_identity() {
+        let command = "node --test app.test.cjs";
+        assert_eq!(
+            super::process_command_summary(&json!({"command":command})),
+            command
+        );
+        assert_eq!(
+            super::process_command_summary(
+                &json!({"program":"powershell.exe","args":["-NoProfile","-Command",command]})
+            ),
+            command
+        );
+        assert_eq!(
+            super::process_command_summary(&json!({"program":"/bin/sh","args":["-lc",command]})),
+            command
+        );
     }
 
     #[test]
@@ -7445,7 +7744,7 @@ console.log("ready");
         ) -> Result<Vec<ModelEvent>, ProviderError> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             let text = if call == 0 {
-                r#"{"tasks":[{"description":"inspect the repository","role":"investigator","dependencies":[],"owned_paths":[],"acceptance_criteria":["Repository evidence is reported."],"deliverables":["Inspection report."],"validation_steps":["Re-read cited evidence."],"forbidden_actions":["Do not modify files."],"contract_notes":["Report exact paths."]}]}"#
+                r#"{"tasks":[{"description":"inspect the repository","role":"investigator","dependencies":[],"owned_paths":[],"acceptance_criteria":["Repository evidence is reported."],"deliverables":["Inspection report."],"validation_steps":[],"forbidden_actions":["Do not modify files."],"contract_notes":["Report exact paths."]}]}"#
             } else {
                 "child completed repository inspection"
             };
@@ -7479,7 +7778,7 @@ console.log("ready");
         ) -> Result<Vec<ModelEvent>, ProviderError> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             let text = if call == 0 {
-                r#"{"tasks":[{"id":"one","description":"inspect one","role":"investigator","dependencies":[],"owned_paths":[],"acceptance_criteria":["First inspection is evidence-backed."],"deliverables":["First report."],"validation_steps":["Check first evidence."],"forbidden_actions":["Do not write."],"contract_notes":[]},{"id":"two","description":"inspect two","role":"investigator","dependencies":[],"owned_paths":[],"acceptance_criteria":["Second inspection is evidence-backed."],"deliverables":["Second report."],"validation_steps":["Check second evidence."],"forbidden_actions":["Do not write."],"contract_notes":[]}]}"#.to_string()
+                r#"{"tasks":[{"id":"one","description":"inspect one","role":"investigator","dependencies":[],"owned_paths":[],"acceptance_criteria":["First inspection is evidence-backed."],"deliverables":["First report."],"validation_steps":[],"forbidden_actions":["Do not write."],"contract_notes":[]},{"id":"two","description":"inspect two","role":"investigator","dependencies":[],"owned_paths":[],"acceptance_criteria":["Second inspection is evidence-backed."],"deliverables":["Second report."],"validation_steps":[],"forbidden_actions":["Do not write."],"contract_notes":[]}]}"#.to_string()
             } else if call <= 2 {
                 let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
                 self.maximum_active.fetch_max(active, Ordering::SeqCst);
@@ -7739,7 +8038,7 @@ console.log("ready");
                             "owned_paths": [],
                             "acceptance_criteria": ["Relevant boundaries are source-backed."],
                             "deliverables": ["Repository map."],
-                            "validation_steps": ["Re-read cited source."],
+                            "validation_steps": [],
                             "forbidden_actions": ["Do not mutate files."],
                             "contract_notes": ["Hand exact paths to the builder."]
                         },
@@ -7751,7 +8050,7 @@ console.log("ready");
                             "owned_paths": ["target/pack-fixture"],
                             "acceptance_criteria": ["The requested behavior is implemented."],
                             "deliverables": ["Working source change."],
-                            "validation_steps": ["Inspect changed source."],
+                            "validation_steps": [],
                             "forbidden_actions": ["Do not edit unrelated files."],
                             "contract_notes": ["Use the repository map."]
                         },
@@ -7760,10 +8059,10 @@ console.log("ready");
                             "description": "Validate the completed change.",
                             "role": "test-debugging-specialist",
                             "dependencies": ["build"],
-                            "owned_paths": ["src"],
+                            "owned_paths": ["."],
                             "acceptance_criteria": ["Validation evidence is explicit."],
                             "deliverables": ["Validation report."],
-                            "validation_steps": ["Run focused tests."],
+                            "validation_steps": ["git --version"],
                             "forbidden_actions": ["Do not conceal failures."],
                             "contract_notes": ["Verify the builder handoff."]
                         }
@@ -7793,6 +8092,8 @@ console.log("ready");
                     name: "fs.mkdir".to_string(),
                     arguments: serde_json::json!({"path": "target/pack-fixture"}),
                 }
+            } else if request.system.contains("Reproduce before concluding") && !request.messages.iter().any(|message| message.content.iter().any(|content| matches!(content, MessageContent::ToolResult { name, .. } if name == "shell.test"))) {
+                ModelEvent::ToolCall { id: "pack-validation".into(), name: "shell.test".into(), arguments: json!({"program": "git", "args": ["--version"]}) }
             } else {
                 ModelEvent::TextDelta {
                     text: format!("{} specialist complete", request.model),
@@ -9442,7 +9743,8 @@ document.title = "Calculator";
                 .expect("message trace")
                 .iter()
                 .any(|messages| {
-                    messages.contains("upstream_completions") && messages.contains("indexed_files")
+                    messages.contains("upstream_completions")
+                        && messages.contains("specialist complete")
                 })
         );
         let assignments = store

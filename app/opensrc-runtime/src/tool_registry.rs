@@ -1213,7 +1213,12 @@ fn process_descriptor(name: &str, description: &str) -> ToolDescriptor {
         },
         "additionalProperties": false
     });
-    let writes_files = matches!(name, "shell.run" | "process.start" | "process.input");
+    // Test commands can write files and launch arbitrary code just like shell.run.
+    // A read-only specialist must not bypass ownership through this label.
+    let writes_files = matches!(
+        name,
+        "shell.run" | "shell.test" | "process.start" | "process.input"
+    );
     descriptor(name, description, schema, false, writes_files, true)
 }
 
@@ -2318,6 +2323,25 @@ fn normalize_explicit_shell_command(
             "`args` cannot be combined with `command`",
         ));
     }
+    if cfg!(windows) && command.contains("<<") {
+        return Err(invalid_process_input(
+            tool,
+            "Bash heredocs are not supported by the Windows shell. Use fs.write for file contents, or program/args for an installed executable.",
+        ));
+    }
+    if cfg!(windows)
+        && command.split_whitespace().next().is_some_and(|word| {
+            matches!(
+                word.to_ascii_lowercase().as_str(),
+                "cmd" | "cmd.exe" | "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe"
+            )
+        })
+    {
+        return Err(invalid_process_input(
+            tool,
+            "Do not nest shells inside `command`. Use direct program/args, e.g. program=node and args=[tests/check.js]. Save complex code with fs.write first.",
+        ));
+    }
     Ok(Some(platform_shell_command(command)))
 }
 
@@ -2421,7 +2445,15 @@ fn platform_shell_command(command: &str) -> (String, Vec<String>) {
             || command.split_whitespace().next().is_some_and(|first| {
                 matches!(
                     first.to_ascii_lowercase().as_str(),
-                    "copy"
+                    "npm"
+                        | "npm.cmd"
+                        | "npx"
+                        | "npx.cmd"
+                        | "pnpm"
+                        | "pnpm.cmd"
+                        | "yarn"
+                        | "yarn.cmd"
+                        | "copy"
                         | "del"
                         | "dir"
                         | "erase"
@@ -2723,14 +2755,35 @@ async fn execute_process(
     .map_err(|error| process_launch_error(program, &error))?;
     let stdout = truncate_bytes(&output.stdout, DEFAULT_MAX_OUTPUT_BYTES);
     let stderr = truncate_bytes(&output.stderr, DEFAULT_MAX_OUTPUT_BYTES);
-    Ok(json!({
+    let mut result = json!({
         "exit_code": output.status.code(),
         "success": output.status.success(),
         "stdout": stdout.0,
         "stdout_truncated": stdout.1,
         "stderr": stderr.0,
         "stderr_truncated": stderr.1
-    }))
+    });
+    let shell = Path::new(program)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    if !output.status.success()
+        && matches!(shell.as_str(), "cmd" | "powershell" | "pwsh")
+        && [
+            "At line:",
+            "ParserError",
+            "is not recognized as an internal or external command",
+            "is not recognized as the name of a cmdlet",
+        ]
+        .iter()
+        .any(|marker| stderr.0.contains(marker))
+    {
+        result["invocation_error"] = json!(
+            "The shell failed to invoke the check; this is not a test assertion failure. Do not retry the unchanged command. Use fs.write to save the check to a script and execute it with direct program/args, without nested shells or escaped inline code."
+        );
+    }
+    Ok(result)
 }
 
 fn process_launch_error(program: &str, error: &std::io::Error) -> ToolExecutionError {
@@ -2754,6 +2807,8 @@ fn restricted_command(
     protected_environment: &[String],
 ) -> Command {
     let mut command = Command::new(program);
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000);
     command.args(args).current_dir(cwd).env_clear();
     for name in safe_environment_names() {
         if !protected_environment

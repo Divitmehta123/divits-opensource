@@ -65,10 +65,9 @@ impl PolicyEngine {
         }
         if request.writes_files
             && agent.workspace.mode == WorkspaceMode::OwnedPaths
-            && !request
-                .target_paths
-                .iter()
-                .all(|path| path_is_owned(path, &agent.workspace.owned_paths))
+            && !request.target_paths.iter().all(|path| {
+                workspace_path_is_owned(path, &agent.workspace.root, &agent.workspace.owned_paths)
+            })
         {
             if request
                 .target_paths
@@ -156,6 +155,9 @@ impl PolicyEngine {
 fn path_is_owned(path: &str, owned_paths: &[String]) -> bool {
     let absolute = Path::new(path).is_absolute();
     let normalized = normalize_policy_path(path);
+    if normalized.split('/').any(|part| part == "..") {
+        return false;
+    }
     owned_paths.iter().any(|owned| {
         let owned = normalize_policy_path(owned);
         let owned = owned.trim_end_matches('/');
@@ -166,7 +168,30 @@ fn path_is_owned(path: &str, owned_paths: &[String]) -> bool {
     })
 }
 
+fn workspace_path_is_owned(path: &str, root: &str, owned_paths: &[String]) -> bool {
+    let resolve = |path: &str| {
+        let path = Path::new(path);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            Path::new(root).join(path)
+        }
+        .to_string_lossy()
+        .into_owned()
+    };
+    path_is_owned(
+        &resolve(path),
+        &owned_paths
+            .iter()
+            .map(|path| resolve(path))
+            .collect::<Vec<_>>(),
+    )
+}
+
 fn normalize_policy_path(path: &str) -> String {
+    if matches!(path, "." | "./" | ".\\") {
+        return ".".to_string();
+    }
     let mut normalized = path.replace('\\', "/");
     if let Some(extended) = normalized.strip_prefix("//?/") {
         normalized = extended.to_string();
@@ -180,7 +205,26 @@ fn normalize_policy_path(path: &str) -> String {
     if cfg!(windows) {
         normalized.make_ascii_lowercase();
     }
-    normalized
+    let prefix = if normalized.starts_with("//") {
+        "//"
+    } else if normalized.starts_with('/') {
+        "/"
+    } else {
+        ""
+    };
+    let normalized = format!(
+        "{prefix}{}",
+        normalized
+            .split('/')
+            .filter(|part| !part.is_empty() && *part != ".")
+            .collect::<Vec<_>>()
+            .join("/")
+    );
+    if normalized.is_empty() && !path.is_empty() {
+        ".".to_string()
+    } else {
+        normalized
+    }
 }
 
 fn denied_by_tool_policy(policy: &ToolPolicy, name: &str) -> bool {
@@ -246,6 +290,35 @@ fn _policy_is_serializable(_: &SandboxPolicy) {}
 #[cfg(test)]
 mod tests {
     use super::path_is_owned;
+
+    #[test]
+    #[cfg(windows)]
+    fn absolute_cwd_inside_relative_owned_scope_needs_no_external_grant() {
+        let root = r"C:\Users\HP\OneDrive\Desktop\calculator";
+        let owned = vec![".".to_string()];
+        assert!(super::workspace_path_is_owned(root, root, &owned));
+        assert!(super::workspace_path_is_owned(
+            r"C:\\Users\\HP\\OneDrive\\Desktop\\calculator",
+            root,
+            &owned
+        ));
+        assert!(!super::workspace_path_is_owned(
+            r"C:\Users\HP\OneDrive\Desktop\other",
+            root,
+            &owned
+        ));
+        assert!(!super::workspace_path_is_owned(
+            root,
+            root,
+            &["src".to_string()]
+        ));
+        assert!(!super::workspace_path_is_owned(
+            r"C:\Users\HP\OneDrive\Desktop\calculator\..\other",
+            root,
+            &owned
+        ));
+        assert!(!path_is_owned(root, &[".".to_string()]));
+    }
 
     #[test]
     fn extended_windows_root_owns_the_same_normal_path_and_children() {

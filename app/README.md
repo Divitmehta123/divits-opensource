@@ -28,6 +28,45 @@ Run a non-interactive task with:
 divit run "Inspect this project, fix the failing tests, and verify the result"
 ```
 
+## Planned application delivery
+
+```powershell
+divit run "Make a calculator on my Desktop, implement it, test it, and verify its local server" --mode agentic
+```
+
+The runtime records and validates the task plan before creating the delivery folder. New-app
+plans use the actual Desktop location (including redirected OneDrive Desktops) unless the user
+names another destination. Source, assets, tests and startup documentation belong in that one
+project folder. Follow-up messages in the same conversation retain its delivery directory;
+ordinary edits to an existing checkout keep that checkout.
+
+Inspection specialists report findings without writing or invoking arbitrary shell commands.
+Writing and validation specialists receive explicit file ownership, dedicated skills and real
+filesystem/process tools. `shell.test` is an execution capability, not a read-only shortcut.
+On a trusted local launcher, ordinary local work does not require per-directory approvals;
+destructive actions, external publication and other consequential operations retain their gates.
+
+`validation_steps` in a plan contains exact executable commands, not prose. Only actual command
+results enter the test ledger. A failed check must be repaired and rerun; unexecuted checks are
+never synthesized as passes. Windows invocation/quoting errors are reported separately, and
+unchanged invalid calls are suppressed with script-based recovery instructions. Runtime errors
+are persisted, unfinished child work is stopped, and the terminal shows nonzero exits as failures.
+
+The generated app still needs its chosen toolchain (for example, Node for a JavaScript app) and
+a functioning model/provider. The runtime cannot guarantee that every model will solve every
+task: exhausted budgets, unavailable dependencies and genuine failures remain explicit failures.
+
+Development gates (the delivery acceptance test additionally requires Node on PATH):
+
+```powershell
+cargo fmt --all -- --check
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+`delivery_acceptance` uses a deterministic provider boundary but real filesystem writes, a
+deliberately failing Node test, a source repair, a passing rerun, and an HTTP startup smoke check.
+
 ## Providers and remembered models
 
 Open `/settings` in the TUI to connect or switch providers. Credentials are stored in the

@@ -762,10 +762,17 @@ async fn run_request(
             "agent": agent
         }))
         .send()
-        .await?
-        .error_for_status()?
-        .json::<CliChatResponse>()
         .await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.unwrap_or_default();
+        let detail = body
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("request failed without a diagnostic");
+        anyhow::bail!("{detail} (HTTP {status})");
+    }
+    let response = response.json::<CliChatResponse>().await?;
     println!("{}", response.result.output);
     if let Some(server_task) = server_task {
         server_task.abort();

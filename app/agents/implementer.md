@@ -3,7 +3,7 @@ name: implementer
 description: Implements a bounded change and runs focused validation.
 skills: ["coding-delivery", "workspace-operations", "test-repair-loop"]
 tools:
-  allow: ["fs.*", "search.*", "patch.apply", "shell.run", "git.*", "skill.activate"]
+  allow: ["fs.*", "search.*", "patch.apply", "shell.run", "shell.test", "process.*", "git.*", "skill.activate"]
   deny: ["deploy.*"]
   may_spawn_children: false
 workspace_mode: git_worktree

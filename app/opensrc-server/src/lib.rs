@@ -1380,12 +1380,15 @@ async fn chat(
             }
             definition.tool_policy.allow = requested;
         }
-        state.runtime.agents.create_root(
-            run.id,
-            &definition,
-            request.message,
-            request.project_root,
-        )?;
+        let execution_root = state
+            .runtime
+            .store
+            .conversation_delivery_workspace(selected.id)?
+            .unwrap_or(request.project_root);
+        state
+            .runtime
+            .agents
+            .create_root(run.id, &definition, request.message, execution_root)?;
     }
     let result = state
         .runtime

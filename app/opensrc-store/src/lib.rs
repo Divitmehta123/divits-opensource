@@ -648,6 +648,28 @@ impl Store {
         Ok(())
     }
 
+    /// Conversation identity stays tied to the launch project; generated apps keep
+    /// their own persistent execution directory for later edits and repairs.
+    pub fn conversation_delivery_workspace(
+        &self,
+        conversation_id: ConversationId,
+    ) -> Result<Option<String>> {
+        let value = self.lock()?.query_row(
+            "SELECT payload_json FROM events WHERE conversation_id = ?1 AND kind = 'workspace.delivery_selected' ORDER BY id DESC LIMIT 1",
+            [conversation_id.to_string()], |row| row.get::<_, String>(0),
+        ).optional()?;
+        value
+            .map(|json| -> Result<Option<String>> {
+                let value: Value = serde_json::from_str(&json)?;
+                Ok(value
+                    .get("root")
+                    .and_then(Value::as_str)
+                    .map(str::to_string))
+            })
+            .transpose()
+            .map(Option::flatten)
+    }
+
     pub fn get_agent(&self, id: AgentId) -> Result<Agent> {
         let connection = self.lock()?;
         let mut agent = connection
@@ -663,6 +685,40 @@ impl Store {
             })
             .and_then(|json| Ok(serde_json::from_str::<Agent>(&json)?))?;
         agent.child_ids = child_ids(&connection, id)?;
+        Ok(agent)
+    }
+
+    /// Set a root's delivery workspace before any children or leases exist.
+    pub fn set_root_workspace(&self, id: AgentId, root: &str) -> Result<Agent> {
+        let mut agent = self.get_agent(id)?;
+        if agent.parent_id.is_some()
+            || !agent.child_ids.is_empty()
+            || !matches!(agent.status, AgentStatus::Queued | AgentStatus::Running)
+            || self
+                .list_workspace_leases(Some(agent.run_id))?
+                .iter()
+                .any(|lease| lease.agent_id == id)
+        {
+            return invalid_lease("workspace can only change before root execution starts");
+        }
+        agent.workspace.root = root.to_string();
+        agent.updated_at = Utc::now();
+        self.lock()?.execute(
+            "UPDATE agents SET data_json = ?1, updated_at = ?2 WHERE id = ?3",
+            params![
+                serde_json::to_string(&agent)?,
+                agent.updated_at.to_rfc3339(),
+                id.to_string()
+            ],
+        )?;
+        self.append_event(
+            agent.run_id,
+            Some(id),
+            None,
+            "workspace.delivery_selected",
+            &serde_json::json!({"root": root}),
+            None,
+        )?;
         Ok(agent)
     }
 
@@ -2398,7 +2454,12 @@ fn normalize_lease_root(value: &str) -> Result<String> {
     if value.is_empty() {
         return invalid_lease("workspace root must not be empty");
     }
-    if let Some(stripped) = value.strip_prefix("//?/") {
+    if let Some(stripped) = value
+        .strip_prefix("//?/UNC/")
+        .or_else(|| value.strip_prefix("//?/unc/"))
+    {
+        value = format!("//{stripped}");
+    } else if let Some(stripped) = value.strip_prefix("//?/") {
         value = stripped.to_string();
     }
     let unc = value.starts_with("//");
@@ -2441,14 +2502,16 @@ fn normalize_owned_scope(value: &str, windows: bool) -> Result<String> {
     if value.is_empty() {
         return invalid_lease("owned path must not be empty");
     }
-    if value.starts_with('/')
-        || value.starts_with("//")
-        || value
-            .as_bytes()
-            .get(1)
-            .is_some_and(|character| *character == b':')
-    {
-        return invalid_lease(format!("owned path `{value}` must be relative"));
+    if value.split('/').any(|segment| segment == "..") {
+        return invalid_lease(format!("owned path `{value}` contains parent traversal"));
+    }
+    if absolute_lease_scope(&value) {
+        // AgentControl authorizes host access. The lease layer must lock the actual
+        // target, including targets outside the agent's working directory.
+        return normalize_lease_root(&value);
+    }
+    if value.as_bytes().get(1) == Some(&b':') {
+        return invalid_lease(format!("owned path `{value}` is drive-relative"));
     }
     let mut segments = Vec::new();
     for segment in value.split('/').filter(|segment| !segment.is_empty()) {
@@ -2546,11 +2609,25 @@ fn lease_overlap(
 }
 
 fn rooted_lease_scope(root: &str, owned_path: &str) -> String {
+    if absolute_lease_scope(owned_path) {
+        return owned_path.to_string();
+    }
     match (root, owned_path) {
         (".", owned) => owned.to_string(),
         (root, ".") => root.to_string(),
         (root, owned) => format!("{root}/{owned}"),
     }
+}
+
+fn absolute_lease_scope(value: &str) -> bool {
+    value.starts_with('/')
+        || value.starts_with("unc:/")
+        || (value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphabetic)
+            && value.as_bytes().get(1) == Some(&b':')
+            && value.as_bytes().get(2) == Some(&b'/'))
 }
 
 fn lease_scope_patterns_overlap(left: &str, right: &str) -> bool {
@@ -3272,6 +3349,70 @@ mod tests {
                 .expect("leases")
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn absolute_owned_paths_lock_the_external_target_across_workspaces() {
+        let store = Store::in_memory().expect("store");
+        let (run_id, first_agent, first_task, second_agent, second_task) = lease_fixture(&store);
+        let first = WorkspaceLeaseRequest {
+            run_id,
+            agent_id: first_agent.id,
+            task_id: Some(first_task.id),
+            mode: WorkspaceLeaseMode::Write,
+            root: "C:/launcher/app".into(),
+            owned_paths: vec![r"C:\calc".into()],
+        };
+        store
+            .acquire_workspace_lease(&first)
+            .expect("trusted absolute scope");
+        let mut second = WorkspaceLeaseRequest {
+            run_id,
+            agent_id: second_agent.id,
+            task_id: Some(second_task.id),
+            mode: WorkspaceLeaseMode::Write,
+            root: "C:/CALC".into(),
+            owned_paths: vec!["index.html".into()],
+        };
+        assert!(matches!(
+            store.acquire_workspace_lease(&second),
+            Err(super::StoreError::WorkspaceLeaseConflict { .. })
+        ));
+        second.root = "D:/calc".into();
+        store
+            .acquire_workspace_lease(&second)
+            .expect("different drive does not conflict");
+        for path in [r"C:\calc\..\escape", "C:calc", "../escape"] {
+            assert!(
+                super::normalize_owned_scope(path, true).is_err(),
+                "accepted {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn delivery_workspace_is_persisted_per_conversation_before_children() {
+        let store = Store::in_memory().expect("store");
+        let conversation = store.create_conversation("C:/launcher", None).unwrap();
+        let run = store
+            .create_run(conversation.id, "build", ExecutionMode::Agentic)
+            .unwrap();
+        let agent = test_agent(run.id);
+        store.create_agent(&agent).unwrap();
+        store.transition_agent(agent.id, AgentStatus::Queued).ok();
+        let agent = store
+            .set_root_workspace(agent.id, "C:/Users/example/Desktop/calculator")
+            .expect("select workspace");
+        assert_eq!(
+            store.get_agent(agent.id).unwrap().workspace.root,
+            agent.workspace.root
+        );
+        assert_eq!(
+            store
+                .conversation_delivery_workspace(conversation.id)
+                .unwrap(),
+            Some(agent.workspace.root)
         );
     }
 

@@ -58,7 +58,7 @@ impl ToolProfile {
     pub const fn writes(self) -> bool {
         matches!(
             self,
-            Self::BoundedWriter | Self::TestWriter | Self::IntegrationWriter
+            Self::BoundedWriter | Self::TestWriter | Self::IntegrationWriter | Self::ReleaseGate
         )
     }
 }
@@ -315,7 +315,21 @@ fn tool_policy_for_profile(profile: ToolProfile) -> ToolPolicy {
             "skill.*",
             "mcp.*",
         ],
-        ToolProfile::ReleaseGate => &["git.status", "git.diff", "shell.test", "process.poll"],
+        ToolProfile::ReleaseGate => &[
+            "fs.read",
+            "fs.read_many",
+            "fs.list",
+            "fs.glob",
+            "fs.stat",
+            "search.*",
+            "git.status",
+            "git.diff",
+            "shell.test",
+            "shell.run",
+            "process.start",
+            "process.poll",
+            "process.kill",
+        ],
     };
     ToolPolicy {
         allow: values.iter().map(|value| (*value).to_string()).collect(),
@@ -360,7 +374,7 @@ pub struct RoutingPolicyRegistry {
 impl RoutingPolicyRegistry {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, RoutingPolicyError> {
         let path = path.as_ref().to_path_buf();
-        let policy = if path.is_file() {
+        let mut policy: RoutingPolicySet = if path.is_file() {
             let bytes = std::fs::read(&path).map_err(|source| RoutingPolicyError::Io {
                 path: path.clone(),
                 source,
@@ -372,6 +386,13 @@ impl RoutingPolicyRegistry {
         } else {
             RoutingPolicySet::default()
         };
+        // Older release profiles described tests as read-only. Commands can produce
+        // artifacts; migrate to task-owned scope, never unrestricted write access.
+        for role in policy.roles.values_mut() {
+            if role.tool_profile == ToolProfile::ReleaseGate && role.writable_paths.is_empty() {
+                role.writable_paths = vec!["<task-owned>".to_string()];
+            }
+        }
         validate_policy_set(&policy)?;
         Ok(Self {
             path: Some(Arc::new(path)),
@@ -1080,7 +1101,7 @@ fn built_in_policy_set() -> RoutingPolicySet {
         "repository-mapper",
         Some("deepseek-pro"),
         ThinkingMode::Enabled,
-        ToolProfile::RuntimeOnly,
+        ToolProfile::ReadOnly,
         &[
             "file indexing",
             "language detection",
@@ -1231,7 +1252,11 @@ fn hybrid_role(
             .then(|| "high".to_string()),
         context_policy: selected_artifacts_context(),
         tool_profile: profile,
-        writable_paths: Vec::new(),
+        writable_paths: if profile.writes() {
+            vec!["<task-owned>".to_string()]
+        } else {
+            Vec::new()
+        },
         cost_class: CostClass::Low,
         latency_class: LatencyClass::Fast,
         independent_reviewer: None,

@@ -5,6 +5,7 @@ mod classifier;
 mod compatibility;
 mod context;
 mod custom_commands;
+mod delivery_workspace;
 mod execution;
 mod local_access;
 mod local_model_compatibility;

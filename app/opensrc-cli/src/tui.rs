@@ -1243,7 +1243,15 @@ impl App {
                     && let Ok(model_event) = serde_json::from_value::<ModelEvent>(value.clone())
                 {
                     match model_event {
-                        ModelEvent::TextDelta { text } => self.streaming_text.push_str(&text),
+                        ModelEvent::TextDelta { text } => {
+                            let planning = self
+                                .runtime_trace
+                                .iter()
+                                .any(|entry| entry.key == "agent:plan" && entry.elapsed.is_none());
+                            if !planning {
+                                self.streaming_text.push_str(&text);
+                            }
+                        }
                         ModelEvent::ToolCall {
                             id,
                             name,
@@ -1432,6 +1440,7 @@ impl App {
                 );
             }
             "agent.plan_started" => {
+                self.streaming_text.clear();
                 let provider = event.payload["provider"].as_str().unwrap_or_default();
                 let model = event.payload["model"].as_str().unwrap_or_default();
                 self.set_trace(
@@ -1444,6 +1453,7 @@ impl App {
                 );
             }
             "agent.plan_created" => {
+                self.streaming_text.clear();
                 let count = event.payload["task_count"].as_u64().unwrap_or_default();
                 self.set_trace(
                     "agent:plan",
@@ -1465,6 +1475,7 @@ impl App {
                 );
             }
             "agent.synthesis_started" => {
+                self.streaming_text.clear();
                 let provider = event.payload["provider"].as_str().unwrap_or_default();
                 let model = event.payload["model"].as_str().unwrap_or_default();
                 self.set_trace(
@@ -1477,6 +1488,7 @@ impl App {
                 );
             }
             "task.contract_issued" => {
+                self.streaming_text.clear();
                 let role = event.payload["role"].as_str().unwrap_or("agent");
                 let provider = event.payload["provider"].as_str().unwrap_or_default();
                 let model = event.payload["model"].as_str().unwrap_or_default();
@@ -1889,6 +1901,7 @@ fn handle_client_event(app: &mut App, event: ClientEvent) {
             app.activity.push_back(format!("run {} cancelled", run.id));
         }
         ClientEvent::ChatFailed(error) => {
+            app.streaming_text.clear();
             app.busy = false;
             app.active_run = None;
             app.loader_started = None;
@@ -5362,9 +5375,14 @@ fn render_content_block_with_details(
             Style::default().fg(Color::DarkGray),
         )],
         MessageContent::ToolResult { name, result, .. } => {
+            let failed = tool_result_failed(result);
             let mut lines = vec![Line::styled(
-                format!("✓ {name}  {}", tool_result_summary(result)),
-                Style::default().fg(Color::Gray),
+                format!(
+                    "{} {name}  {}",
+                    if failed { "×" } else { "✓" },
+                    tool_result_summary(result)
+                ),
+                Style::default().fg(if failed { Color::LightRed } else { Color::Gray }),
             )];
             if show_tool_details {
                 lines.extend(tool_result_details(result).lines().map(|line| {
@@ -5411,6 +5429,28 @@ fn tool_result_details(result: &Value) -> String {
 }
 
 fn tool_result_summary(result: &Value) -> String {
+    let output = result.get("output").unwrap_or(result);
+    if output.get("exit_code").is_some() || output.get("success").is_some() {
+        let code = output
+            .get("exit_code")
+            .and_then(Value::as_i64)
+            .map_or_else(|| "unknown".to_string(), |code| code.to_string());
+        let detail = if tool_result_failed(result) {
+            output
+                .get("stderr")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("command failed")
+                .chars()
+                .take(160)
+                .collect::<String>()
+        } else {
+            "completed".to_string()
+        };
+        return format!("exit {code} · {detail}");
+    }
     let entries = result
         .pointer("/output/entries")
         .or_else(|| result.get("entries"))
@@ -5446,6 +5486,16 @@ fn tool_result_summary(result: &Value) -> String {
         return format!("{} characters", content.chars().count());
     }
     "done".to_string()
+}
+
+fn tool_result_failed(result: &Value) -> bool {
+    let output = result.get("output").unwrap_or(result);
+    result.get("error").is_some()
+        || output.get("success") == Some(&Value::Bool(false))
+        || output
+            .get("exit_code")
+            .and_then(Value::as_i64)
+            .is_some_and(|code| code != 0)
 }
 
 fn render_agents(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
@@ -8355,6 +8405,28 @@ mod tests {
         assert!(rendered.contains("Capabilities"));
         assert!(rendered.contains("Permissions"));
         assert!(!rendered.contains("Chat │"));
+    }
+
+    #[test]
+    fn failed_processes_are_not_rendered_as_successful_tool_calls() {
+        let result = serde_json::json!({"output": {"exit_code": 1, "success": false, "stderr": "ParserError: invalid heredoc\nlong trace"}});
+        assert!(super::tool_result_failed(&result));
+        assert_eq!(
+            super::tool_result_summary(&result),
+            "exit 1 · ParserError: invalid heredoc"
+        );
+        let lines = render_content_block(&MessageContent::ToolResult {
+            provider_call_id: "failed".into(),
+            canonical_call_id: "failed".into(),
+            name: "shell.test".into(),
+            result,
+            timing_ms: Some(10),
+            approval_state: None,
+        });
+        assert!(lines[0].to_string().starts_with("× shell.test"));
+        assert!(!super::tool_result_failed(
+            &serde_json::json!({"output": {"success": true, "exit_code": 0}})
+        ));
     }
 
     #[test]
